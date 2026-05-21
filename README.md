@@ -1,4 +1,9 @@
 # Ai-control
+
+
+https://github.com/user-attachments/assets/91cf147a-84f3-49de-bd83-a24be2cd6cba
+
+
 # 🏗️ ระบบควบคุมเครื่องโกยหินทรายสำหรับการผสมคอนกรีตด้วยปัญญาประดิษฐ์
 > **AI-Powered Aggregate Scraper Control System for Concrete Batching Plants**
 
