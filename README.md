@@ -22,19 +22,9 @@ https://github.com/user-attachments/assets/91cf147a-84f3-49de-bd83-a24be2cd6cba
 
 ระบบแบ่งการทำงานออกเป็น 3 ส่วนหลัก (ตามโครงสร้างโค้ดใน Repository นี้):
 
-+-----------------------+
-                    | Intel RealSense D435i |
-                    +-----------+-----------+
-                                |
-                                | (Depth Data)
-                                v
-+-------------------+   +-------------------+   +-------------------+
-|  Web Application  |   |  Main Processing  |   | STM32 Controller  |
-|                   |<->|     (Pi/ROS)      |-->|                   |
-| - Flask           |   | - YOLO Detection  |   | - Motor Control   |
-| - Monitoring      |   | - 3D Height Map   |   | - Actuator        |
-+-------------------+   +-------------------+   +-------------------+
-  
+<img width="1105" height="567" alt="image" src="https://github.com/user-attachments/assets/eb0c7789-0238-486d-844c-59e7a5165fa9" />
+
+
 1. **Vision & AI Processing (`Main_pi.py`, `Main_ros.py`)**
    * รับข้อมูลภาพและระยะลึก (Depth) จากกล้อง **Intel RealSense D435i**
    * ใช้ **YOLO (Deep Learning)** ในการตรวจจับและจำแนกประเภทกองวัตถุดิบ (หิน/ทราย)
