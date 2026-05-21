@@ -38,6 +38,7 @@ https://github.com/user-attachments/assets/91cf147a-84f3-49de-bd83-a24be2cd6cba
    * แปลงพิกัดทางกายภาพ (X, Y, Z) ที่ได้จาก AI ไปเป็นคำสั่งควบคุมมอเตอร์และระบบกลไกของเครื่องโกยหินทราย
 
 3. **User Interface (`web_crane.py`)**
+   * https://ais-pre-5gx6sfdolsljil3rgsh5lb-199159180132.asia-southeast1.run.app/
    * เว็บแอปพลิเคชันสำหรับแสดงผลการทำงานแบบ Real-time (Monitoring) ตรวจสอบสถานะระบบ และสั่งการทำงานในโหมด Manual ผ่านหน้าเว็บ
 
 ---
