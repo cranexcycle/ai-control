@@ -1,1404 +1,1287 @@
-#!/usr/bin/env python3
-import rclpy
-from rclpy.node import Node
-import threading
-import math
-import time
-import socket
-import json
-import cv2
-import numpy as np
-from sensor_msgs.msg import JointState
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-from std_msgs.msg import String
-try:
-    from ultralytics import YOLO
-    YOLO_AVAILABLE = True
-except ImportError:
-    YOLO_AVAILABLE = False
-    print("⚠️  ultralytics ไม่ได้ติดตั้ง — YOLO safety check ถูกปิดการใช้งาน")
-PI_IP = "10.0.0.2"
-PI_PORT = 5001
-LISTEN_PORT = 5001
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-INVERT_TWIN_ROTATION = True
-ENCODER_MIN = 0
-ENCODER_MAX = 61
-GAZEBO_RAD_MIN = -1.60
-GAZEBO_RAD_MAX = 1.60
-SLOT_TARGETS = {1: 7, 2: 32, 3: 54}
-CYCLE_TRAVEL_TIME = 11.0
-BANG_BANG_HZ = 20
-BANG_BANG_DT = 1.0 / BANG_BANG_HZ
-HOMING_TIMEOUT = 30.0
-E2_MIN = 0
-E2_MAX = 325
-ARM_RAD_AT_E2_MIN = -0.52
-ARM_RAD_AT_E2_MAX = 0.0
-def e2_to_arm_rad(e2_val):
-    e2_clamped = max(E2_MIN, min(E2_MAX, e2_val))
-    ratio = float(e2_clamped - E2_MIN) / (E2_MAX - E2_MIN)
-    return ARM_RAD_AT_E2_MIN + ratio * (ARM_RAD_AT_E2_MAX - ARM_RAD_AT_E2_MIN)
-VALVE_REPEAT_CMDS = {"UP_ON", "DOWN_ON"}
-VALVE_REPEAT_INTERVAL = 1.0
-VALVE_REPEAT_DURATION = 13.0
-P4_TIMEOUT = 20.0
-E2_DOWN_THRESHOLD = 290
-CAMERA_STREAM_URL = "http://10.0.0.2:5002/video_feed"
-YOLO_MODEL_PATH = "yolov8n.pt"
-YOLO_DANGER_CLASSES = {
-    0: "person", 1: "bicycle", 2: "car", 3: "motorcycle",
-    5: "bus", 6: "train", 7: "truck", 14: "bird", 15: "cat",
-    16: "dog", 17: "horse", 18: "sheep", 19: "cow",
-    20: "elephant", 21: "bear",
+import React, { useEffect, useState, useRef, useMemo } from 'react';
+import * as ROSLIB from 'roslib';
+import { cn } from './lib/utils';
+import { Wifi, WifiOff, AlertCircle, Activity, PlugZap, Users, ChevronLeft, Home, Layout, FileText, Plus, Search, Play, Image, Menu, Cpu } from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
+import { 
+  ResponsiveContainer, 
+  LineChart, 
+  Line, 
+  XAxis, 
+  YAxis, 
+  CartesianGrid, 
+  Tooltip, 
+  ReferenceLine,
+  AreaChart,
+  Area
+} from 'recharts';
+
+interface CraneStatus {
+  p1: number;
+  p2: number;
+  p3: number;
+  is_system_ready: boolean;
+  is_moving: boolean;
+  cycle_running: boolean;
+  last_bungkee_pos: number;
+  current_head_deg: number;
 }
-YOLO_CONFIDENCE = 0.35
-YOLO_DANGER_TIMEOUT = 120.0
-YOLO_CHECK_INTERVAL = 0.25
-YOLO_CLEAR_COUNTDOWN = 3.0
-YOLO_STABLE_BEFORE_COUNTDOWN = 2.0
-YOLO_ROI = {"top": 0.15, "bottom": 0.85, "left": 0.10, "right": 0.90}
-YOLO_DEBOUNCE_SEC = 1.5
-XCYCLE_CAPTURE_ROUNDS = [
-    {"round": 1, "pct": 100, "label": "1st (100%)"},
-    {"round": 2, "pct": 65,  "label": "2nd (65%)"},
-    {"round": 3, "pct": 50,  "label": "3rd (50%)"},
-]
-XCYCLE_CAM_TIMEOUT = 10.0
-# ===== X-CYCLE MULTI-PASS: จำนวนรอบสูงสุดที่จะวนกลับไปโกยซ้ำต่อช่อง =====
-XCYCLE_MAX_PASSES = 20
 
+export default function App() {
+  const [ros, setRos] = useState<ROSLIB.Ros | null>(null);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [connected, setConnected] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [isDesktop, setIsDesktop] = useState(window.innerWidth >= 1280);
 
-class YoloSafetyMonitor:
-    WINDOW_NAME = "🔍 YOLO Safety Monitor — Crane System"
-    def __init__(self, stream_url, model_path, logger=None):
-        self._url = stream_url
-        self._model_path = model_path
-        self._logger = logger
-        self._model = None
-        self._lock = threading.Lock()
-        self._danger = False
-        self._raw_detected = False
-        self._detect_since = None
-        self._DEBOUNCE = YOLO_DEBOUNCE_SEC
-        self._last_frame = None
-        self._running = False
-        self._thread = None
-        self._display_thread = None
-    def _log(self, msg):
-        if self._logger:
-            self._logger.info(msg)
-        else:
-            print(msg)
-    def start(self):
-        if not YOLO_AVAILABLE:
-            self._log("⚠️  [YOLO] ultralytics ไม่พร้อม — ข้าม")
-            return
-        try:
-            self._log(f"🔍 [YOLO] โหลด model: {self._model_path}")
-            self._model = YOLO(self._model_path)
-            self._log("✅ [YOLO] โหลด model สำเร็จ")
-        except Exception as e:
-            self._log(f"❌ [YOLO] โหลด model ล้มเหลว: {e}")
-            return
-        self._running = True
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
-        self._thread.start()
-        self._display_thread = threading.Thread(target=self._display_loop, daemon=True)
-        self._display_thread.start()
-        self._log(f"▶️  [YOLO] เริ่ม stream จาก {self._url}")
-        self._log(f"🖥️  [YOLO] เปิด popup window: '{self.WINDOW_NAME}'")
-    def stop(self):
-        self._running = False
-        try:
-            cv2.destroyWindow(self.WINDOW_NAME)
-        except Exception:
-            pass
-    @property
-    def is_danger(self):
-        with self._lock:
-            return self._danger
-    def _draw_overlay(self, frame, danger, labels):
-        h, w = frame.shape[:2]
-        bar_color = (0, 0, 220) if danger else (0, 180, 0)
-        cv2.rectangle(frame, (0, 0), (w, 40), bar_color, -1)
-        status_text = f"DANGER: {', '.join(labels)}" if danger else "SAFE"
-        cv2.putText(frame, status_text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
-        ts = time.strftime("%H:%M:%S")
-        cv2.putText(frame, ts, (w - 90, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
-        return frame
-    def _run_loop(self):
-        cap = None
-        while self._running:
-            try:
-                if cap is None or not cap.isOpened():
-                    self._log(f"📷 [YOLO] เชื่อมต่อ stream: {self._url}")
-                    cap = cv2.VideoCapture(self._url)
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                    cap.set(cv2.CAP_PROP_FPS, 30)
-                    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000)
-                    if not cap.isOpened():
-                        self._log("⚠️  [YOLO] ไม่สามารถเชื่อมต่อกล้อง — รอ 2s แล้วลองใหม่")
-                        placeholder = np.zeros((240, 320, 3), dtype=np.uint8)
-                        cv2.putText(placeholder, "Connecting to camera...", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 255), 2)
-                        with self._lock:
-                            self._last_frame = placeholder
-                        time.sleep(2.0)
-                        cap = None
-                        continue
-                for _ in range(4):
-                    cap.grab()
-                ret, frame = cap.retrieve()
-                if not ret:
-                    ret, frame = cap.read()
-                if not ret:
-                    self._log("⚠️  [YOLO] อ่านเฟรมล้มเหลว — เชื่อมต่อใหม่")
-                    cap.release()
-                    cap = None
-                    time.sleep(1.0)
-                    continue
-                h, w = frame.shape[:2]
-                roi_t = int(h * YOLO_ROI["top"])
-                roi_b = int(h * YOLO_ROI["bottom"])
-                roi_l = int(w * YOLO_ROI["left"])
-                roi_r = int(w * YOLO_ROI["right"])
-                roi_frame = frame[roi_t:roi_b, roi_l:roi_r]
-                results = self._model(roi_frame, conf=YOLO_CONFIDENCE, classes=list(YOLO_DANGER_CLASSES.keys()), verbose=False)
-                detected = False
-                labels_found = []
-                annotated = frame.copy()
-                for r in results:
-                    for box in r.boxes:
-                        cls_id = int(box.cls[0])
-                        if cls_id not in YOLO_DANGER_CLASSES:
-                            continue
-                        detected = True
-                        label = YOLO_DANGER_CLASSES[cls_id]
-                        conf = float(box.conf[0])
-                        labels_found.append(f"{label}({conf:.2f})")
-                now = time.time()
-                with self._lock:
-                    if detected:
-                        if self._detect_since is None:
-                            self._detect_since = now
-                            self._raw_detected = True
-                        elif (now - self._detect_since) >= self._DEBOUNCE:
-                            if not self._danger:
-                                self._danger = True
-                                self._log(f"🚨 [YOLO] DANGER ยืนยัน: {', '.join(labels_found)}")
-                    else:
-                        if self._danger:
-                            self._log("✅ [YOLO] พื้นที่ปลอดภัยแล้ว")
-                        self._danger = False
-                        self._raw_detected = False
-                        self._detect_since = None
-                    confirmed = self._danger
-                annotated = self._draw_overlay(annotated, confirmed, labels_found)
-                with self._lock:
-                    self._last_frame = annotated
-            except Exception as e:
-                self._log(f"❌ [YOLO] loop error: {e}")
-                if cap:
-                    cap.release()
-                cap = None
-                time.sleep(2.0)
-        if cap:
-            cap.release()
-        self._log("⏹️  [YOLO] หยุด inference loop แล้ว")
-    def _display_loop(self):
-        cv2.namedWindow(self.WINDOW_NAME, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(self.WINDOW_NAME, 800, 480)
-        self._log("🖥️  [DISPLAY] เริ่ม display loop")
-        while self._running:
-            with self._lock:
-                frame = self._last_frame.copy() if self._last_frame is not None else None
-            if frame is not None:
-                cv2.imshow(self.WINDOW_NAME, frame)
-            key = cv2.waitKey(30) & 0xFF
-            if key == ord('q'):
-                self._log("🖥️  [DISPLAY] กด q — ปิด display window")
-                break
-        cv2.destroyWindow(self.WINDOW_NAME)
-        self._log("🖥️  [DISPLAY] หยุด display loop แล้ว")
+  useEffect(() => {
+    const handleResize = () => setIsDesktop(window.innerWidth >= 1280);
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+  const [wsUrl, setWsUrl] = useState('ws://localhost:9090');
+  const [videoUrl, setVideoUrl] = useState(() => {
+    const saved = localStorage.getItem('crane_video_url');
+    if (!saved || saved.includes('1.102')) return 'http://192.168.1.109:5002/video_feed';
+    return saved;
+  });
+  const [showSettings, setShowSettings] = useState(false);
+  const [view, setView] = useState<'main' | 'info' | 'gallery' | 'dev'>('main');
+  const [lang, setLang] = useState<'th' | 'en'>('en');
+  const [selectedImage, setSelectedImage] = useState<string | null>(null);
 
+  const labels = {
+    th: {
+      status: "สถานะ",
+      project_info: "ข้อมูลโครงการ",
+      back: "กลับ",
+      change_lang: "เปลี่ยนภาษา",
+      connect: "เชื่อมต่อ",
+      disconnect: "ตัดการเชื่อมต่อ",
+      ready: "ระบบพร้อม",
+      not_ready: "รอดำเนินการ",
+      moving: "กำลังเคลื่อนที่",
+      idle: "หยุด",
+      full: "เต็ม",
+      empty: "ว่าง",
+      text_alarm: "ข้อความ / แจ้งเตือน",
+      vision: "ความคาดหวังของโครงการ",
+      vision_desc: "ในอุตสาหกรรมการผลิตปูนซีเมนต์หรือคอนกรีตสำเร็จรูป กระบวนการจัดการและควบคุมการขนย้ายวัตถุดิบจำพวกหินและทรายเข้าสู่ระบบผสม ถือเป็นขั้นตอนวิกฤตที่มีผลโดยตรงต่อความแม่นยำของสูตรผสมและคุณภาพของผลิตภัณฑ์ปลายทาง ปัจจุบันสถานประกอบการส่วนใหญ่ยังคงอาศัยแรงงานมนุษย์ในการควบคุมเครื่องจักรแบบแมนนวล (Manual Control) ซึ่งมักประสบปัญหาด้านความคลาดเคลื่อนของปริมาณวัตถุดิบ ความไม่สม่ำเสมอในการปฏิบัติงานอันเกิดจากความเหนื่อยล้า รวมถึงความเสี่ยงต่ออุบัติเหตุในพื้นที่ปฏิบัติงาน\n\nด้วยเหตุนี้ การนำเทคโนโลยีปัญญาประดิษฐ์ (Artificial Intelligence: AI) ร่วมกับระบบวิสัยทัศน์คอมพิวเตอร์ (Computer Vision) เข้ามาประยุกต์ใช้จึงเป็นแนวทางสำคัญในการเปลี่ยนผ่านสู่ระบบอุตสาหกรรมอัจฉริยะ โดยการใช้กล้องตรวจจับความลึก (Depth Camera) ร่วมกับอัลกอริทึมการเรียนรู้เชิงลึก (Deep Learning) จะช่วยให้ระบบสามารถวิเคราะห์สภาพแวดล้อมได้แบบเรียลไทม์ สามารถคำนวณจุดตักวัสดุที่เหมาะสมที่สุด (Peak Detection) และตรวจจับสิ่งกีดขวางเพื่อความปลอดภัย ซึ่งไม่เพียงแต่ช่วยเพิ่มประสิทธิภาพและแผนการทำงานที่แม่นยำ แต่ยังช่วยลดต้นทุนด้านแรงงานและยกระดับมาตรฐานความปลอดภัยในพื้นที่ทำงานได้อย่างยั่งยืน",
+      features: "คุณสมบัติเด่น",
+      team: "ทีมผู้พัฒนา",
+      return: "กลับหน้าหลัก",
+      display: "จอแสดงผล",
+      waiting_signal: "กำลังรอสัญญาณภาพ...",
+      architecture: "สถาปัตยกรรมระบบ",
+      dev_label: "นักพัฒนา",
+      inst_label: "สถาบัน",
+      inst_value: "วิศวกรรมระบบอุตสาหกรรม มจพ.",
+      version: "เวอร์ชัน",
+      gallery: "บรรยากาศหน้างาน",
+      search_similar: "ค้นหาสิ่งที่คล้ายกัน",
+      developer_page: "คณะผู้ร่วมอุดมการณ์"
+    },
+    en: {
+      status: "STATUS",
+      project_info: "Information",
+      back: "Back",
+      change_lang: "Change Language",
+      connect: "CONNECT",
+      disconnect: "DISCONNECT",
+      ready: "System Ready",
+      not_ready: "Pending",
+      moving: "Moving",
+      idle: "Idle",
+      full: "FULL",
+      empty: "EMPTY",
+      text_alarm: "TEXT / ALARM",
+      vision: "The Vision",
+      vision_desc: "In the cement and precast concrete manufacturing industry, managing and controlling the transport of raw materials like stone and sand into mixing systems is a critical process affecting mixture accuracy and product quality. Currently, most facilities rely on human labor for manual control, leading to potential inaccuracies, operational inconsistencies due to fatigue, and safety risks.\n\nApplying Artificial Intelligence (AI) and Computer Vision is key to transitioning toward smart industry. Using Depth Cameras with Deep Learning algorithms enables real-time environment analysis, optimal scoop point calculation (Peak Detection), and obstacle detection. This enhances efficiency, ensures precision, reduces labor costs, and sustainably elevates workplace safety standards.",
+      features: "Key Features",
+      team: "Development Team",
+      return: "HOME",
+      display: "DISPLAY",
+      waiting_signal: "Waiting for camera signal...",
+      architecture: "System Architecture",
+      dev_label: "Developer",
+      inst_label: "Institution",
+      inst_value: "King Mongkut's University of Technology North Bangkok",
+      version: "Version",
+      gallery: "Field Gallery",
+      search_similar: "Search Similar",
+      developer_page: "DEVELOPERS"
+    }
+  } as const;
 
-class CraneIntegratedSystem(Node):
-    def __init__(self):
-        super().__init__('crane_integrated_system')
-        self.current_head_deg = 0.0
-        self.last_cmd = None
-        self.system_started = False
-        self.is_moving = False
-        self.bungkee_active = False
-        self.rotation_dir = None
-        self.last_bungkee_time = 0
-        self.last_bungkee_pos = 0.0
-        self.bungkee_cmd = None
-        self.bungkee_debounce_duration = 0.15
-        self.pending_bungkee_cmd = None
-        self.cmd_timestamp = 0
-        self.brake_triggered = False
-        self.is_braking_now = False
-        self.brake_off_timestamp = 0
-        self.e1_offset = 0
-        self.smooth_pos = GAZEBO_RAD_MIN
-        self.alpha = 0.85
-        self.last_sent_pos = GAZEBO_RAD_MIN
-        self.gz_publisher = self.create_publisher(JointTrajectory, '/arm_group_controller/joint_trajectory', 10)
-        self.status_pub = self.create_publisher(String, '/crane_status', 10)
-        self.create_subscription(String, '/web_control_topic', self.web_control_callback, 10)
-        self.e1_raw = None
-        self.e2_raw = None
-        self.ls1_state = 0
-        self.ls2_state = 0
-        self.p1 = 0
-        self.p2 = 0
-        self.p3 = 0
-        self.p4 = 0
-        self.e1_position = 0
-        self.is_homed = False
-        self._sensor_lock = threading.Lock()
-        self.cycle_running = False
-        self.target_e1_from_cam = None
-        self.cam_target_event = threading.Event()
-        self._ls1_count_1 = 0
-        self._ls1_count_0 = 0
-        self._ls2_count_1 = 0
-        self._ls2_count_0 = 0
-        self.DEBOUNCE_LIMIT = 1
-        self._ls1_last = 0
-        self._ls2_last = 0
-        self._valve_repeat_lock = threading.Lock()
-        self._valve_repeat_active = {}
-        self.listen_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.listen_sock.bind(("0.0.0.0", LISTEN_PORT))
-        self.listen_sock.settimeout(0.1)
-        self.is_system_ready = False
-        self.create_subscription(JointState, '/joint_states', self.joint_callback, 10)
-        self._safety_paused = False
-        self._safety_lock = threading.Lock()
-        self._danger_start = 0.0
-        self._pi_emergency = False
-        self._pi_emergency_lock = threading.Lock()
-        self._xcycle_capture_round = {1: 0, 2: 0, 3: 0}
-        self._xcycle_round_lock = threading.Lock()
-        self._manual_homed = False  # True หลังจาก Home ครั้งแรกใน Manual mode
+  const t = labels[lang];
 
-        # ── Manual mode: lock แยกจาก cycle_running ──────────────────────
-        self._manual_lock = threading.Lock()   # ป้องกัน m ซ้อนกัน
-        self._manual_moving = False            # True ขณะกำลัง move ใน manual
+  const [currentTime, setCurrentTime] = useState(new Date().toLocaleString('en-US'));
+  
+  const [craneState, setCraneState] = useState<CraneStatus>({
+    p1: 0, p2: 0, p3: 0,
+    is_system_ready: false,
+    is_moving: false,
+    cycle_running: false,
+    last_bungkee_pos: 0,
+    current_head_deg: 0
+  });
 
-        self.yolo_monitor = YoloSafetyMonitor(
-            stream_url=CAMERA_STREAM_URL,
-            model_path=YOLO_MODEL_PATH,
-            logger=self.get_logger(),
-        )
-        self.yolo_monitor.start()
-        threading.Thread(target=self.udp_monitor, daemon=True).start()
-        threading.Thread(target=self._safety_watchdog, daemon=True).start()
-        self.get_logger().info("🔥 CRANE FAST-TWIN SYSTEM READY (NO MOVEIT - WAITING PI START)")
+  const [lastSent, setLastSent] = useState<string | null>(null);
+  const [lastReceived, setLastReceived] = useState<string | null>(null);
+  const [lastReceivedTime, setLastReceivedTime] = useState<number | null>(null);
+  const [latency, setLatency] = useState<number | null>(null);
+  const [posHistory, setPosHistory] = useState<{ x: number, y: number, time: number }[]>([]);
 
-    def reset_state(self):
-        self.is_moving = False
-        self.system_started = False
-        self.rotation_dir = None
-        self.last_cmd = None
-        self.bungkee_active = False
-        self.bungkee_cmd = None
-        self.pending_bungkee_cmd = None
-        self.brake_triggered = False
-        self.is_braking_now = False
-        self.brake_off_timestamp = 0
-        self.cam_target_event.set()
-        self._stop_all_valve_repeat()
+  // ── NEW: summary state ──────────────────────────────────────────────
+  const [lastSummary, setLastSummary] = useState<string | null>(null);
+  const [showSummary, setShowSummary] = useState(false);
 
-    def _handle_pi_emergency(self, state):
-        with self._pi_emergency_lock:
-            prev = self._pi_emergency
-            self._pi_emergency = bool(state)
-        if state == 1 and not prev:
-            self.get_logger().error("🚨 [PI EMERGENCY] GPIO16 กด Emergency — EMERGENCY SHUTDOWN ทันที!")
-            self.emergency_shutdown()
-        elif state == 0 and prev:
-            self.get_logger().info("✅ [PI EMERGENCY] GPIO16 ปล่อยแล้ว — รอ START ใหม่จาก Pi")
+  const webControlTopic = useRef<ROSLIB.Topic | null>(null);
 
-    def _safety_watchdog(self):
-        while rclpy.ok():
-            time.sleep(0.1)
-            if not self.is_system_ready:
-                continue
-            if not self.yolo_monitor.is_danger:
-                with self._safety_lock:
-                    if self._safety_paused:
-                        pass
-                    else:
-                        continue
-                stable_start = time.time()
-                stable_ok = True
-                self.get_logger().info(f"👁️  [WATCHDOG] พื้นที่ปลอดภัย — รอ stable {YOLO_STABLE_BEFORE_COUNTDOWN:.0f}s ก่อนนับ countdown...")
-                while time.time() - stable_start < YOLO_STABLE_BEFORE_COUNTDOWN:
-                    time.sleep(0.1)
-                    if self.yolo_monitor.is_danger:
-                        self.get_logger().warn("🚨 [WATCHDOG] เจออีกระหว่างรอ stable — รอใหม่")
-                        stable_ok = False
-                        break
-                if not stable_ok:
-                    continue
-                self.get_logger().info(f"⏳ [WATCHDOG] พื้นที่ปลอดภัย — นับถอยหลัง {YOLO_CLEAR_COUNTDOWN:.0f}s ก่อน resume...")
-                countdown_ok = True
-                for remaining in range(int(YOLO_CLEAR_COUNTDOWN), 0, -1):
-                    self.get_logger().info(f"⏳ [WATCHDOG] resume ใน {remaining}s...")
-                    time.sleep(1.0)
-                    if self.yolo_monitor.is_danger:
-                        self.get_logger().warn("🚨 [WATCHDOG] พบสิ่งกีดขวางระหว่างนับถอยหลัง — reset countdown!")
-                        countdown_ok = False
-                        break
-                if countdown_ok:
-                    with self._safety_lock:
-                        self._safety_paused = False
-                    self.get_logger().info("✅ [WATCHDOG] ครบ countdown — resume การทำงาน")
-                    self.send_udp("DANGER_OFF", bypass_safety=True)
-                continue
-            with self._safety_lock:
-                already_paused = self._safety_paused
-                if not already_paused:
-                    self._safety_paused = True
-                    self._danger_start = time.time()
-                    self.get_logger().warn(f"🚨 [WATCHDOG] พบสิ่งกีดขวาง — หยุด process ทันที (max {YOLO_DANGER_TIMEOUT:.0f}s)")
-                    self.send_udp("DANGER_ON", bypass_safety=True)
-                    self.send_udp("MAG1_OFF", bypass_safety=True)
-                    self.send_udp("MAG2_OFF", bypass_safety=True)
-                    self.send_udp("UP_OFF", bypass_safety=True)
-                    self.send_udp("DOWN_OFF", bypass_safety=True)
-                    self._stop_all_valve_repeat()
-            with self._safety_lock:
-                elapsed = time.time() - self._danger_start
-            if elapsed >= YOLO_DANGER_TIMEOUT:
-                self.get_logger().error(f"🛑 [WATCHDOG] ครบ {YOLO_DANGER_TIMEOUT:.0f}s ยังเจอสิ่งกีดขวาง — EMERGENCY STOP!")
-                self.send_udp("DANGER_OFF", bypass_safety=True)
-                self.emergency_shutdown()
+  useEffect(() => {
+    document.title = "AI-Controlled Sand/Stone Machine";
+  }, []);
 
-    def _wait_if_paused(self, label=""):
-        if not self._safety_paused:
-            return True
-        self.get_logger().info(f"⏸️  [{label}] process หยุดค้าง — รอพื้นที่ปลอดภัย + countdown {YOLO_CLEAR_COUNTDOWN:.0f}s...")
-        while rclpy.ok() and self.is_system_ready:
-            with self._safety_lock:
-                if not self._safety_paused:
-                    self.get_logger().info(f"▶️  [{label}] countdown ครบ — resume ต่อ")
-                    cmd = self.bungkee_cmd
-                    if cmd == "UP":
-                        self.get_logger().info(f"🔁 [{label}] resume → ส่ง UP_ON ต่อ")
-                        self.send_udp("DOWN_OFF", bypass_safety=True)
-                        self.send_udp("UP_ON", bypass_safety=True)
-                    elif cmd == "DOWN":
-                        self.get_logger().info(f"🔁 [{label}] resume → ส่ง DOWN_ON ต่อ")
-                        self.send_udp("UP_OFF", bypass_safety=True)
-                        self.send_udp("DOWN_ON", bypass_safety=True)
-                    return True
-            time.sleep(0.1)
-        return False
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const locale = view === 'main' ? 'en-US' : (lang === 'th' ? 'th-TH' : 'en-US');
+      setCurrentTime(new Date().toLocaleString(locale, { 
+        weekday: 'long', 
+        year: 'numeric', 
+        month: 'long', 
+        day: 'numeric', 
+        hour: '2-digit', 
+        minute: '2-digit', 
+        second: '2-digit' 
+      }));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [view, lang]);
 
-    def yolo_safety_check(self, label=""):
-        if not YOLO_AVAILABLE or self._model_is_off():
-            return True
-        if not self.yolo_monitor.is_danger:
-            return True
-        tag = f"YOLO-SAFETY{'['+label+']' if label else ''}"
-        self.get_logger().warn(f"🚨 [{tag}] พบสิ่งกีดขวาง → หยุดรอ (max {YOLO_DANGER_TIMEOUT:.0f}s)")
-        deadline = time.time() + YOLO_DANGER_TIMEOUT + YOLO_CLEAR_COUNTDOWN + 5.0
-        while rclpy.ok() and self.is_system_ready:
-            if time.time() > deadline:
-                break
-            with self._safety_lock:
-                if not self._safety_paused:
-                    self.get_logger().info(f"✅ [{tag}] พื้นที่ปลอดภัยแล้ว (รวม countdown) — ทำงานต่อ")
-                    return True
-            time.sleep(0.1)
-        self.get_logger().error(f"🛑 [{tag}] หมดเวลารอ — EMERGENCY STOP!")
-        self.emergency_shutdown()
-        return False
+  // Persist settings
+  useEffect(() => {
+    localStorage.setItem('crane_ws_url', wsUrl);
+  }, [wsUrl]);
 
-    def _model_is_off(self):
-        return self.yolo_monitor._model is None
+  useEffect(() => {
+    localStorage.setItem('crane_video_url', videoUrl);
+  }, [videoUrl]);
 
-    def calculate_mapping(self, enc_pos_0_max):
-        enc_pos_0_max = max(ENCODER_MIN, min(ENCODER_MAX, enc_pos_0_max))
-        ratio = float(enc_pos_0_max - ENCODER_MIN) / (ENCODER_MAX - ENCODER_MIN)
-        if INVERT_TWIN_ROTATION:
-            ratio = 1.0 - ratio
-        raw_target = GAZEBO_RAD_MIN + ratio * (GAZEBO_RAD_MAX - GAZEBO_RAD_MIN)
-        self.smooth_pos = (self.alpha * raw_target) + ((1 - self.alpha) * self.smooth_pos)
-        return max(GAZEBO_RAD_MIN, min(GAZEBO_RAD_MAX, self.smooth_pos))
+  // No auto-connect on load - user must click CONNECT manually to start telemetry
 
-    def publish_to_gazebo(self, rad, sec=0.1, arm_rad=None):
-        traj_msg = JointTrajectory()
-        traj_msg.joint_names = ['headcrane_Link', 'armcrane_Link']
-        point = JointTrajectoryPoint()
-        arm_val = float(arm_rad) if arm_rad is not None else float(self.last_bungkee_pos)
-        point.positions = [float(rad), arm_val]
-        point.time_from_start.sec = int(sec)
-        point.time_from_start.nanosec = int((sec - int(sec)) * 1e9)
-        traj_msg.points.append(point)
-        self.gz_publisher.publish(traj_msg)
+  // Clear state when disconnected
+  const resetState = () => {
+    setCraneState({
+      p1: 0,
+      p2: 0,
+      p3: 0,
+      is_system_ready: false,
+      is_moving: false,
+      cycle_running: false,
+      last_bungkee_pos: 0.0,
+      current_head_deg: 0.0
+    });
+    setLastReceived('NO DATA INCOMING...');
+    setLastReceivedTime(null);
+  };
 
-    def encoder_to_rad(self, enc_pos):
-        enc_pos = max(0, min(ENCODER_MAX, enc_pos))
-        ratio = float(enc_pos) / ENCODER_MAX
-        if INVERT_TWIN_ROTATION:
-            ratio = 1.0 - ratio
-        return GAZEBO_RAD_MIN + ratio * (GAZEBO_RAD_MAX - GAZEBO_RAD_MIN)
+  // Helper to find ROSLIB classes (Ros, Topic, Message) across different bundle types
+  const getRosLibClass = (name: string) => {
+    // Try directly on ROSLIB object
+    if ((ROSLIB as any)[name]) return (ROSLIB as any)[name];
+    // Try on .default if it exists
+    if ((ROSLIB as any).default && (ROSLIB as any).default[name]) return (ROSLIB as any).default[name];
+    // Fallback to global window.ROSLIB if it leaked there
+    if ((window as any).ROSLIB && (window as any).ROSLIB[name]) return (window as any).ROSLIB[name];
+    
+    console.warn(`ROSLIB.${name} not found in current context. Available keys:`, Object.keys(ROSLIB));
+    return null;
+  };
 
-    def get_e1_position(self):
-        with self._sensor_lock:
-            if self.e1_raw is None:
-                return 0
-            enc_pos = self.e1_raw - self.e1_offset
-            return max(0, min(ENCODER_MAX, enc_pos))
+  const connect = () => {
+    if (ros) ros.close();
+    resetState();
+    setError(null);
+    console.log("Attempting to connect to:", wsUrl);
+    
+    try {
+      const RosClass = getRosLibClass('Ros');
+      if (!RosClass) {
+        setError("ROSLIB.Ros is undefined");
+        return;
+      }
+      
+      const rb = new RosClass({ url: wsUrl });
 
-    def _valve_repeat_worker(self, cmd, stop_event):
-        deadline = time.time() + VALVE_REPEAT_DURATION
-        self.get_logger().info(f"🔁 [VALVE REPEAT] เริ่มส่ง {cmd} ซ้ำนาน {VALVE_REPEAT_DURATION:.0f}s")
-        while not stop_event.is_set() and time.time() < deadline:
-            try:
-                sock.sendto(cmd.encode(), (PI_IP, PI_PORT))
-            except Exception as e:
-                print(f"Valve repeat send error: {e}")
-            stop_event.wait(timeout=VALVE_REPEAT_INTERVAL)
-        self.get_logger().info(f"🔁 [VALVE REPEAT] หยุดส่ง {cmd}")
-        with self._valve_repeat_lock:
-            self._valve_repeat_active.pop(cmd, None)
+      rb.on('connection', () => {
+        console.log("✅ ROSBridge Connected");
+        setConnected(true);
+        setError(null);
+        setRos(rb);
 
-    def _start_valve_repeat(self, cmd):
-        self._stop_valve_repeat(cmd)
-        stop_event = threading.Event()
-        with self._valve_repeat_lock:
-            self._valve_repeat_active[cmd] = stop_event
-        t = threading.Thread(target=self._valve_repeat_worker, args=(cmd, stop_event), daemon=True)
-        t.start()
-
-    def _stop_valve_repeat(self, cmd):
-        with self._valve_repeat_lock:
-            ev = self._valve_repeat_active.pop(cmd, None)
-        if ev:
-            ev.set()
-
-    def _stop_all_valve_repeat(self):
-        with self._valve_repeat_lock:
-            events = list(self._valve_repeat_active.values())
-            self._valve_repeat_active.clear()
-        for ev in events:
-            ev.set()
-
-    def send_udp(self, cmd, bypass_safety=False):
-        try:
-            sock.sendto(cmd.encode(), (PI_IP, PI_PORT))
-            if cmd in VALVE_REPEAT_CMDS:
-                self._start_valve_repeat(cmd)
-            elif cmd == "UP_OFF":
-                self._stop_valve_repeat("UP_ON")
-            elif cmd == "DOWN_OFF":
-                self._stop_valve_repeat("DOWN_ON")
-        except Exception as e:
-            print(f"send_udp error: {e}")
-
-    def _wait_for_p4(self, timeout=P4_TIMEOUT, label=""):
-        self.get_logger().info(f"⏳ [{label}] รอ P4=1 (timeout {timeout}s)...")
-        t_start = time.time()
-        while rclpy.ok() and self.is_system_ready:
-            with self._sensor_lock:
-                p4 = self.p4
-            if p4 == 1:
-                self.get_logger().info(f"✅ [{label}] P4=1 ยืนยันแล้ว")
-                return True
-            if (time.time() - t_start) > timeout:
-                self.get_logger().error(f"❌ [{label}] P4 TIMEOUT ({timeout}s) — หยุดการทำงาน!")
-                return False
-            time.sleep(0.05)
-        return False
-
-    def initial_arm_lift(self):
-        self.get_logger().info("⬆️ [ARM LIFT] UP_ON (13s) ...")
-        self.send_udp("DOWN_OFF", bypass_safety=True)
-        self.send_udp("UP_ON", bypass_safety=True)
-        time.sleep(VALVE_REPEAT_DURATION)
-        self.send_udp("UP_OFF", bypass_safety=True)
-        self.get_logger().info(f"⬆️ [ARM LIFT] UP_OFF แล้ว — รอ P4=1 ภายใน {P4_TIMEOUT}s...")
-        if not self._wait_for_p4(timeout=P4_TIMEOUT, label="ARM LIFT"):
-            self.get_logger().error("🚫 [ARM LIFT] P4 ไม่ทำงาน — ยกเลิกการทำงานทั้งหมด!")
-            self.emergency_shutdown()
-            return False
-        time.sleep(0.3)
-        return True
-
-    def _wait_for_sensor_data(self, timeout=5.0, label=""):
-        self.get_logger().info(f"⏳ [{label}] รอรับ sensor data จาก Pi (timeout {timeout}s)...")
-        t_start = time.time()
-        while rclpy.ok() and self.is_system_ready:
-            with self._sensor_lock:
-                got_data = self.e1_raw is not None
-            if got_data:
-                with self._sensor_lock:
-                    p4_val = self.p4
-                self.get_logger().info(f"✅ [{label}] ได้รับ sensor data แล้ว — P4={p4_val}")
-                return True
-            if (time.time() - t_start) > timeout:
-                self.get_logger().warn(f"⚠️ [{label}] รอ sensor data timeout ({timeout}s) — ใช้ค่าปัจจุบัน (p4={self.p4})")
-                return False
-            time.sleep(0.05)
-        return False
-
-    def do_homing(self, label="HOMING"):
-        if not self.system_started:
-            self.send_udp("ARM"); time.sleep(0.2); self.send_udp("START")
-            self.system_started = True
-        self._wait_for_sensor_data(timeout=5.0, label=label)
-        with self._sensor_lock:
-            p4_now = self.p4
-        self.get_logger().info(f"🔍 [{label}] อ่านค่า P4={p4_now} (หลังรอ sensor data)")
-        if p4_now == 1:
-            self.get_logger().info("✅ [HOMING] P4=1 แขนอยู่ตำแหน่งบนแล้ว — เริ่ม MAG1_ON ทันที")
-        else:
-            self.get_logger().info("⚠️ [HOMING] P4=0 — สั่ง UP_ON จนครบกระบอกก่อน...")
-            self.send_udp("DOWN_OFF", bypass_safety=True)
-            self.send_udp("UP_ON", bypass_safety=True)
-            time.sleep(VALVE_REPEAT_DURATION)
-            self.send_udp("UP_OFF", bypass_safety=True)
-            self.get_logger().info(f"⬆️ [HOMING] UP_ON ครบ 13s แล้ว — รอ P4=1 ภายใน {P4_TIMEOUT}s ก่อน MAG1_ON...")
-            if not self._wait_for_p4(timeout=P4_TIMEOUT, label=f"{label}-WAIT-P4"):
-                self.get_logger().error(f"🚫 [{label}] P4 ไม่ทำงานหลัง UP_OFF — ยกเลิก Homing!")
-                self.emergency_shutdown()
-                return False
-            self.get_logger().info(f"✅ [{label}] P4=1 ยืนยันแล้ว — เริ่ม MAG1_ON")
-        self.get_logger().info(f"🏠 [{label}] เริ่ม Homing ไปทางซ้าย (รอ LS1)...")
-        self.is_homed = False
-        self.send_udp("MAG1_ON", bypass_safety=True)
-        self.send_udp("MAG2_OFF", bypass_safety=True)
-        start_time = time.time()
-        while rclpy.ok() and self.is_system_ready:
-            if self._safety_paused:
-                if not self._wait_if_paused(f"{label}-HOMING-LOOP"):
-                    return False
-                self.get_logger().info(f"🔁 [{label}] resume homing → ส่ง MAG1_ON ใหม่")
-                self.send_udp("MAG2_OFF", bypass_safety=True)
-                self.send_udp("MAG1_ON", bypass_safety=True)
-            with self._sensor_lock:
-                ls1 = self.ls1_state
-            if ls1 == 1:
-                self.send_udp("MAG1_OFF")
-                self.send_udp("MAG2_OFF")
-                with self._sensor_lock:
-                    self.e1_offset = self.e1_raw if self.e1_raw is not None else 0
-                    self.smooth_pos = GAZEBO_RAD_MAX if INVERT_TWIN_ROTATION else GAZEBO_RAD_MIN
-                    self.last_sent_pos = self.smooth_pos
-                self.is_homed = True
-                self.publish_to_gazebo(self.smooth_pos, sec=0.2)
-                self.get_logger().info(f"✅ [{label}] Homing สำเร็จ! e1_offset={self.e1_offset}")
-                return True
-            if (time.time() - start_time) > HOMING_TIMEOUT:
-                self.send_udp("MAG1_OFF")
-                self.send_udp("MAG2_OFF")
-                self.get_logger().error(f"❌ [{label}] Homing Timeout!")
-                return False
-            time.sleep(0.05)
-        return False
-
-    E2_UP_THRESHOLD = -180
-
-    def do_bungkee_task(self):
-        if not self.yolo_safety_check(label="BUNGKEE-PRE"):
-            return False
-        self.get_logger().info(f"⚙️ [BUNGKEE] DOWN_ON — รอจนกว่า E2 ≥ {E2_DOWN_THRESHOLD} (ไม่มี timeout)...")
-        self.send_udp("UP_OFF")
-        self.send_udp("DOWN_ON")
-        self.bungkee_cmd = "DOWN"
-        self.brake_triggered = False
-        while rclpy.ok() and self.is_system_ready:
-            if not self._wait_if_paused("BUNGKEE-DOWN"):
-                break
-            with self._sensor_lock:
-                e2 = self.e2_raw if self.e2_raw is not None else 0
-            if e2 >= E2_DOWN_THRESHOLD:
-                self.get_logger().info(f"⚙️ [BUNGKEE] E2={e2} ≥ {E2_DOWN_THRESHOLD} → DOWN_OFF")
-                break
-            time.sleep(0.02)
-        self.send_udp("DOWN_OFF")
-        self.get_logger().info("⚙️ [BUNGKEE] รอ 5 วินาที...")
-        wait_start = time.time()
-        while time.time() - wait_start < 5.0:
-            if not self._wait_if_paused("BUNGKEE-WAIT5"):
-                break
-            time.sleep(0.1)
-        self.get_logger().info(f"⚙️ [BUNGKEE] UP_ON — รอจนกว่า E2 ≤ {self.E2_UP_THRESHOLD}...")
-        self.send_udp("DOWN_OFF")
-        self.send_udp("UP_ON")
-        self.bungkee_cmd = "UP"
-        self.brake_triggered = False
-        while rclpy.ok() and self.is_system_ready:
-            if not self._wait_if_paused("BUNGKEE-UP"):
-                break
-            with self._sensor_lock:
-                e2 = self.e2_raw if self.e2_raw is not None else 9999
-            if e2 <= self.E2_UP_THRESHOLD:
-                self.get_logger().info(f"⚙️ [BUNGKEE] E2={e2} ≤ {self.E2_UP_THRESHOLD} → UP_OFF")
-                break
-            time.sleep(0.02)
-        self.send_udp("UP_OFF")
-        self.get_logger().info(f"⚙️ [BUNGKEE] UP_OFF แล้ว — รอ P4=1 ภายใน {P4_TIMEOUT}s...")
-        if not self._wait_for_p4(timeout=P4_TIMEOUT, label="BUNGKEE UP"):
-            self.get_logger().error("🚫 [BUNGKEE] P4 ไม่ทำงาน — ยกเลิกการทำงานทั้งหมด!")
-            self.emergency_shutdown()
-            return False
-        self.bungkee_cmd = None
-        self.get_logger().info("✅ [BUNGKEE] Task เสร็จสิ้น")
-        return True
-
-    def run_cycle(self, slot_number):
-        """
-        Cycle โหมดช่องเดียว (ปรับปรุงใหม่)
-        เหมือน Auto Process แต่ทำเฉพาะช่อง slot_number ช่องเดียวจนเต็ม
-        ขั้นตอน: Home → ไปกลางช่อง → แคปรูป → เดินไปพิกัดที่กล้องบอก → โกย → วนซ้ำ
-        """
-        if not self.is_system_ready or self.cycle_running:
-            return False
-        self.cycle_running = True
-        slot = slot_number
-        center_enc = SLOT_TARGETS.get(slot, 6)
-        cycle_start = time.time()
-        total_scoops = 0
-
-        try:
-            self.get_logger().info(f"🔄 [CYCLE-{slot}] เริ่ม Cycle ช่อง {slot}")
-            if not self.do_homing(label=f"CYCLE{slot}-HOME"):
-                return False
-            time.sleep(0.5)
-            self._xcycle_reset_round(slot)
-
-            pass_num = 0
-            while rclpy.ok() and self.is_system_ready:
-                if self._is_slot_full(slot):
-                    self.get_logger().info(f"✅ [CYCLE-{slot}] ช่อง {slot} เต็มแล้ว — จบ Cycle")
-                    break
-                pass_num += 1
-                if pass_num > XCYCLE_MAX_PASSES:
-                    self.get_logger().warn(
-                        f"⚠️ [CYCLE-{slot}] ครบ {XCYCLE_MAX_PASSES} ครั้งแล้ว — หยุด"
-                    )
-                    break
-
-                self.get_logger().info(
-                    f"🎯 [CYCLE-{slot}] ครั้งที่ {pass_num} "
-                    f"→ เคลื่อนที่ไปกลางช่อง (E1: {center_enc})"
-                )
-                self.move_to_enc(center_enc, 0.0)
-                if self._is_slot_full(slot):
-                    break
-
-                self.get_logger().info("⏳ [CYCLE] รอ 2 วินาที ให้กล้องนิ่ง...")
-                wait_start = time.time()
-                while time.time() - wait_start < 2.0:
-                    if not self._wait_if_paused(f"CYCLE{slot}-CAM-WAIT"):
-                        break
-                    time.sleep(0.1)
-                if self._is_slot_full(slot):
-                    break
-
-                with self._xcycle_round_lock:
-                    cur_round_idx = self._xcycle_capture_round[slot]
-                target_e1 = self._xcycle_request_capture(
-                    slot=slot, round_idx=cur_round_idx,
-                    label=f"CYCLE-S{slot}-P{pass_num}"
-                )
-                if target_e1 is None:
-                    self.get_logger().warn(
-                        f"⚠️ [CYCLE-{slot}] หมดเวลารอพิกัด → เลื่อน round แล้วลองใหม่"
-                    )
-                    self._xcycle_advance_round(slot)
-                    continue
-                if self._is_slot_full(slot):
-                    break
-
-                self.get_logger().info(f"🚀 [CYCLE-{slot}] เดินไปพิกัด E1={target_e1}")
-                self.move_to_enc(target_e1, 0.0)
-                time.sleep(0.5)
-                if self._is_slot_full(slot):
-                    break
-
-                total_scoops += 1
-                self.get_logger().info(
-                    f"⚙️ [CYCLE-{slot}] โกยครั้งที่ {total_scoops}"
-                )
-                if not self.do_bungkee_task():
-                    self.get_logger().error(f"🚫 [CYCLE-{slot}] Bungkee ล้มเหลว — หยุด")
-                    return False
-                self._xcycle_advance_round(slot)
-
-            elapsed = time.time() - cycle_start
-            full_tag = "เต็ม ✅" if self._is_slot_full(slot) else "ยังไม่เต็ม ⚠️"
-            self.get_logger().info(
-                f"📊 [CYCLE-{slot}] จบ | โกย {total_scoops} ครั้ง | "
-                f"{self._fmt_seconds(elapsed)} | {full_tag}"
-            )
-            print(f"\n[CYCLE-{slot}] โกย {total_scoops} ครั้ง | "
-                  f"{self._fmt_seconds(elapsed)} | {full_tag}\n")
-            return True
-        finally:
-            self.cycle_running = False
-
-    @staticmethod
-    def _fmt_seconds(secs):
-        if secs >= 60:
-            m = int(secs) // 60
-            s = secs - m * 60
-            return f"{m}m {s:.1f}s"
-        return f"{secs:.1f}s"
-
-    def _is_slot_full(self, slot):
-        with self._sensor_lock:
-            return {1: self.p1, 2: self.p2, 3: self.p3}.get(slot, 0) == 1
-
-    def _xcycle_request_capture(self, slot, round_idx, label=""):
-        rnd_info = XCYCLE_CAPTURE_ROUNDS[round_idx]
-        cmd_payload = json.dumps({
-            "XCAP": 1, "SLOT": slot,
-            "ROUND": rnd_info["round"], "PCT": rnd_info["pct"],
-        })
-        self.get_logger().info(
-            f"📸 [{label}] ส่งคำสั่งถ่ายรูป slot={slot} "
-            f"round={rnd_info['round']} pct={rnd_info['pct']}% → Pi"
-        )
-        self.cam_target_event.clear()
-        self.target_e1_from_cam = None
-        try:
-            sock.sendto(cmd_payload.encode(), (PI_IP, PI_PORT))
-        except Exception as e:
-            self.get_logger().error(f"❌ [{label}] ส่ง XCAP ล้มเหลว: {e}")
-            return None
-        self.get_logger().info(
-            f"⏳ [{label}] รอรับพิกัดจากกล้อง [{rnd_info['label']}] (timeout {XCYCLE_CAM_TIMEOUT}s)..."
-        )
-        got = self.cam_target_event.wait(timeout=XCYCLE_CAM_TIMEOUT)
-        if got and self.target_e1_from_cam is not None:
-            e1 = self.target_e1_from_cam
-            self.get_logger().info(f"✅ [{label}] ได้รับพิกัด E1={e1} [{rnd_info['label']}]")
-            return e1
-        else:
-            self.get_logger().warn(f"⚠️ [{label}] หมดเวลารอพิกัด [{rnd_info['label']}]")
-            return None
-
-    def _xcycle_advance_round(self, slot):
-        with self._xcycle_round_lock:
-            current = self._xcycle_capture_round[slot]
-            nxt = (current + 1) % len(XCYCLE_CAPTURE_ROUNDS)
-            self._xcycle_capture_round[slot] = nxt
-            return nxt
-
-    def _xcycle_reset_round(self, slot):
-        with self._xcycle_round_lock:
-            self._xcycle_capture_round[slot] = 0
-        self.get_logger().info(f"🔄 [AUTO PROCESS] reset capture round ของช่อง {slot} → round 1 (100%)")
-
-    # =====================================================================
-    # run_x_cycle (Auto Process) — โกยช่องปัจจุบันให้เต็มก่อนเสมอ แล้ววนกลับเช็คทุกช่องใหม่จนทุกช่องเต็ม
-    # กฎ: เลือกช่องหมายเลขน้อยสุดที่ยังไม่เต็ม → โกยให้เต็ม → วนใหม่
-    # =====================================================================
-    def run_x_cycle(self):
-        if not self.is_system_ready or self.cycle_running:
-            self.get_logger().warn("⚠️ [AUTO PROCESS] ระบบยังไม่พร้อมหรือกำลังทำงานอยู่")
-            return False
-        self.cycle_running = True
-        total_start = time.time()
-
-        slot_results = {
-            s: {"time": 0.0, "scoops": 0, "passes": 0, "pass_log": []}
-            for s in [1, 2, 3]
+        const TopicClass = getRosLibClass('Topic');
+        if (!TopicClass) {
+          console.error("ROSLIB.Topic is undefined");
+          return;
         }
 
-        try:
-            self.get_logger().info("🔄 [AUTO PROCESS] เริ่มโหมด Auto Process")
-            if not self.do_homing(label="AUTO-PROCESS-HOME"):
-                return False
-            time.sleep(0.5)
-            for slot in [1, 2, 3]:
-                self._xcycle_reset_round(slot)
+        // Advertise the control topic
+        webControlTopic.current = new TopicClass({
+          ros: rb,
+          name: '/web_control_topic',
+          messageType: 'std_msgs/String',
+        });
+        webControlTopic.current.advertise();
+      });
 
-            outer_pass = 0
-            while rclpy.ok() and self.is_system_ready:
-                slots_not_full = [s for s in [1, 2, 3] if not self._is_slot_full(s)]
-                if not slots_not_full:
-                    self.get_logger().info("✅ [AUTO PROCESS] ทุกช่องเต็มแล้ว — จบการทำงาน")
-                    break
-                outer_pass += 1
-                slot = slots_not_full[0]
-                center_enc = SLOT_TARGETS.get(slot, 6)
-                slot_pass_start = time.time()
+      rb.on('error', (err) => {
+        console.error("❌ ROSBridge Error:", err);
+        setConnected(false);
+        if (wsUrl.includes('localhost')) {
+          setError('Localhost connection failed. If you are on mobile, use the computer IP instead.');
+        } else {
+          setError('Connection failed. Is ROSBridge running?');
+        }
+      });
 
-                slot_results[slot]["passes"] += 1
-                current_pass_num = slot_results[slot]["passes"]
-                pass_scoops_before = slot_results[slot]["scoops"]
+      rb.on('close', () => {
+        console.log("🔌 ROSBridge Closed");
+        setConnected(false);
+        setRos(null);
+        resetState();
+      });
+    } catch (e) {
+      setError('Invalid WebSocket URL format');
+    }
+  };
 
-                self.get_logger().info(
-                    f"🔁 [AUTO PROCESS] Outer pass {outer_pass} | "
-                    f"ช่องที่ยังไม่เต็ม: {slots_not_full} | เลือกโกยช่อง {slot} ให้เต็มก่อน "
-                    f"(pass ที่ {current_pass_num} ของช่อง {slot})"
-                )
+  // Subscribe to raw status from Python node
+  useEffect(() => {
+    if (!ros || !connected) return;
 
-                while rclpy.ok() and self.is_system_ready:
-                    if self._is_slot_full(slot):
-                        self.get_logger().info(
-                            f"✅ [AUTO PROCESS] ช่อง {slot} เต็มแล้ว → ออกไปเช็คช่องถัดไป"
-                        )
-                        break
-                    pass_num_inner = slot_results[slot]["scoops"] + 1
-                    if slot_results[slot]["passes"] > XCYCLE_MAX_PASSES:
-                        self.get_logger().warn(
-                            f"⚠️ [AUTO PROCESS] ช่อง {slot} ครบ {XCYCLE_MAX_PASSES} pass → ข้ามไปช่องถัดไป"
-                        )
-                        break
-                    self.get_logger().info(
-                        f"🎯 [AUTO PROCESS] ช่อง {slot} | pass {current_pass_num} | scoop ที่ {pass_num_inner} "
-                        f"→ เคลื่อนที่ไปกลางช่อง (E1: {center_enc})"
-                    )
-                    self.move_to_enc(center_enc, 0.0)
-                    if self._is_slot_full(slot):
-                        self.get_logger().info(f"✅ [AUTO PROCESS] ช่อง {slot} เต็มหลัง move center")
-                        break
-                    self.get_logger().info("⏳ [AUTO PROCESS] รอ 2 วินาที ให้กล้องนิ่ง...")
-                    wait_start = time.time()
-                    while time.time() - wait_start < 2.0:
-                        if not self._wait_if_paused("AUTO-PROCESS-CAM-WAIT"):
-                            break
-                        time.sleep(0.1)
-                    if self._is_slot_full(slot):
-                        self.get_logger().info(f"✅ [AUTO PROCESS] ช่อง {slot} เต็มระหว่างรอกล้อง")
-                        break
-                    with self._xcycle_round_lock:
-                        cur_round_idx = self._xcycle_capture_round[slot]
-                    rnd_info = XCYCLE_CAPTURE_ROUNDS[cur_round_idx]
-                    self.get_logger().info(
-                        f"📡 [AUTO PROCESS] ช่อง {slot} | capture {rnd_info['label']} (round idx={cur_round_idx})"
-                    )
-                    target_e1 = self._xcycle_request_capture(
-                        slot=slot, round_idx=cur_round_idx,
-                        label=f"AUTO-PROCESS-S{slot}-P{current_pass_num}"
-                    )
-                    if target_e1 is None:
-                        self.get_logger().warn(
-                            f"⚠️ [AUTO PROCESS] ช่อง {slot} หมดเวลารอพิกัด [{rnd_info['label']}] → เลื่อน round แล้วลองใหม่"
-                        )
-                        self._xcycle_advance_round(slot)
-                        continue
-                    if self._is_slot_full(slot):
-                        self.get_logger().info(f"✅ [AUTO PROCESS] ช่อง {slot} เต็มหลังได้พิกัด")
-                        break
-                    self.get_logger().info(
-                        f"🚀 [AUTO PROCESS] เคลื่อนที่ไปพิกัด E1={target_e1} [{rnd_info['label']}]"
-                    )
-                    self.move_to_enc(target_e1, 0.0)
-                    time.sleep(0.5)
-                    if self._is_slot_full(slot):
-                        self.get_logger().info(f"✅ [AUTO PROCESS] ช่อง {slot} เต็มหลัง move target")
-                        break
-                    slot_results[slot]["scoops"] += 1
-                    self.get_logger().info(
-                        f"⚙️ [AUTO PROCESS] โกยครั้งที่ {slot_results[slot]['scoops']} "
-                        f"ของช่อง {slot} [{rnd_info['label']}]"
-                    )
-                    if not self.do_bungkee_task():
-                        self.get_logger().error("🚫 [AUTO PROCESS] Bungkee task ล้มเหลว → หยุดการทำงาน")
-                        pass_elapsed = time.time() - slot_pass_start
-                        slot_results[slot]["time"] += pass_elapsed
-                        slot_results[slot]["pass_log"].append({
-                            "pass":   current_pass_num,
-                            "scoops": slot_results[slot]["scoops"] - pass_scoops_before,
-                            "time":   pass_elapsed,
-                        })
-                        return False
-                    next_round_idx = self._xcycle_advance_round(slot)
-                    self.get_logger().info(
-                        f"🔁 [AUTO PROCESS] เลื่อน round ช่อง {slot} → "
-                        f"{XCYCLE_CAPTURE_ROUNDS[next_round_idx]['label']}"
-                    )
-                    if self._is_slot_full(slot):
-                        self.get_logger().info(f"✅ [AUTO PROCESS] ช่อง {slot} เต็มหลังโกย")
-                        break
+    const TopicClass = getRosLibClass('Topic');
+    if (!TopicClass) {
+      console.error("ROSLIB.Topic is undefined for subscription");
+      return;
+    }
 
-                pass_elapsed = time.time() - slot_pass_start
-                slot_results[slot]["time"] += pass_elapsed
-                scoops_this_pass = slot_results[slot]["scoops"] - pass_scoops_before
-                slot_results[slot]["pass_log"].append({
-                    "pass":   current_pass_num,
-                    "scoops": scoops_this_pass,
-                    "time":   pass_elapsed,
-                })
-                full_tag = "เต็ม ✅" if self._is_slot_full(slot) else "ยังไม่เต็ม ⚠️"
-                self.get_logger().info(
-                    f"⏱️ [AUTO PROCESS] outer pass {outer_pass} | ช่อง {slot} pass {current_pass_num} — "
-                    f"โกย: {scoops_this_pass} ครั้ง | เวลา: {self._fmt_seconds(pass_elapsed)} | {full_tag}"
-                )
+    const statusTopic = new TopicClass({
+      ros: ros,
+      name: '/crane_status',
+      messageType: 'std_msgs/String'
+    });
 
-            self.get_logger().info("🏠 [AUTO PROCESS] ทุกช่องเต็มแล้ว → กลับ Home")
-            self.do_homing(label="AUTO-PROCESS-END-HOME")
+    console.log("Subscribing to /crane_status...");
+    statusTopic.subscribe((message: any) => {
+      try {
+        const now = Date.now();
+        setLastReceivedTime(now);
+        
+        let raw = "";
+        if (typeof message.data === 'string') {
+          raw = message.data;
+        } else if (message.data && typeof message.data.toString === 'function') {
+          raw = message.data.toString();
+        }
 
-            total_elapsed = time.time() - total_start
-            total_scoops  = sum(r["scoops"] for r in slot_results.values())
-            total_passes  = sum(r["passes"] for r in slot_results.values())
-            sep  = "=" * 62
-            sep2 = "─" * 62
+        setLastReceived(raw);
+        
+        let data: any = {};
+        
+        // Try JSON parsing first for maximum reliability
+        try {
+          if (raw.trim().startsWith('{')) {
+            data = JSON.parse(raw);
+          }
+        } catch (e) {
+          // Fallback to regex parsing if JSON fails
+          const allMatches = raw.matchAll(/([a-zA-Z0-9_]{1,15})\s*[:=\s]?\s*(-?[\d.]+)/g);
+          for (const match of allMatches) {
+            data[match[1]] = match[2];
+          }
+        }
+        
+        // ── ดักรับ summary field ────────────────────────────────────────
+        if (data.summary && typeof data.summary === 'string') {
+          setLastSummary(data.summary);
+          setShowSummary(true);
+        }
+        
+        const normalized: any = {};
+        
+        // Normalize all keys and handle values
+        Object.keys(data).forEach(key => {
+          const val = data[key];
+          const lowKey = key.toLowerCase().trim();
+          
+          // Basic number conversion for everything that looks like a number
+          const numVal = parseFloat(String(val));
+          const isNum = !isNaN(numVal);
 
-            self.get_logger().info(sep)
-            self.get_logger().info("📊 [AUTO PROCESS] สรุปผลการทำงาน")
-            self.get_logger().info(sep)
-            for slot in [1, 2, 3]:
-                r = slot_results[slot]
-                full_tag = "✅ เต็ม" if self._is_slot_full(slot) else "⚠️ ยังไม่เต็ม"
-                self.get_logger().info(
-                    f"   ช่อง {slot} : รวม {self._fmt_seconds(r['time']):>10}  |  "
-                    f"โกย {r['scoops']} ครั้ง  |  {r['passes']} รอบ  |  {full_tag}"
-                )
-                for pl in r["pass_log"]:
-                    self.get_logger().info(
-                        f"      └ รอบที่ {pl['pass']:>2} : "
-                        f"โกย {pl['scoops']} ครั้ง  |  เวลา {self._fmt_seconds(pl['time'])}"
-                    )
-            self.get_logger().info(sep2)
-            self.get_logger().info(
-                f"   รวมทั้งหมด : {self._fmt_seconds(total_elapsed):>10}  |  "
-                f"โกย {total_scoops} ครั้ง  |  {total_passes} รอบ"
-            )
-            self.get_logger().info(sep)
+          // Handle specific aliases
+          if (lowKey === 'e1' || lowKey === 'last_bungkee_pos' || lowKey === 'dist') {
+            if (isNum) normalized.last_bungkee_pos = numVal;
+          }
+          else if (lowKey === 'e2' || lowKey === 'current_head_deg' || lowKey === 'azim') {
+            if (isNum) normalized.current_head_deg = numVal;
+          }
+          // Generic handles for p1, p2, p3
+          else if (['p1', 'p2', 'p3'].includes(lowKey)) {
+            normalized[lowKey] = isNum ? numVal : (val === true || val === 'true' ? 1 : 0);
+          }
+          // Boolean flags
+          else if (typeof val === 'boolean') {
+            normalized[lowKey] = val;
+          }
+          else if (isNum) {
+            normalized[lowKey] = numVal;
+          }
+          else {
+            normalized[lowKey] = val;
+          }
+        });
 
-            def _dw(s):
-                w = 0
-                for c in s:
-                    cp = ord(c)
-                    w += 2 if (0x1100 <= cp <= 0x115F or 0x2E80 <= cp <= 0x303E or
-                                0x3040 <= cp <= 0xA4CF or 0xAC00 <= cp <= 0xD7AF or
-                                0xF900 <= cp <= 0xFAFF or 0xFE10 <= cp <= 0xFE1F or
-                                0xFE30 <= cp <= 0xFE4F or 0xFF00 <= cp <= 0xFF60 or
-                                0xFFE0 <= cp <= 0xFFE6 or 0x1F004 <= cp <= 0x1F9FF or
-                                0x0E00  <= cp <= 0x0E7F) else 1
-                return w
-            def _col(text, width, align="left"):
-                pad = max(0, width - _dw(text))
-                return (text + " " * pad) if align == "left" else (" " * pad + text)
+        if (Object.keys(normalized).length > 0) {
+          setCraneState(prev => ({
+            ...prev,
+            ...normalized
+          }));
+        }
 
-            CW = [8, 12, 10, 7, 10]
-            TOTAL_W = sum(CW) + 4 * 2
+        // Update Position History for Chart
+        if (normalized.last_bungkee_pos !== undefined || normalized.current_head_deg !== undefined) {
+          setPosHistory(prev => {
+            const newPos = {
+              x: normalized.current_head_deg !== undefined ? normalized.current_head_deg : (prev[prev.length - 1]?.x ?? 0),
+              y: normalized.last_bungkee_pos !== undefined ? normalized.last_bungkee_pos : (prev[prev.length - 1]?.y ?? 0),
+              time: now
+            };
+            
+            if (prev.length > 0) {
+              const last = prev[prev.length - 1];
+              if (Math.abs(last.x - newPos.x) < 0.01 && Math.abs(last.y - newPos.y) < 0.01) return prev;
+            }
+            
+            return [...prev, newPos].slice(-40);
+          });
+        }
+      } catch (e) {
+        console.error("Status parse error:", e);
+      }
+    });
 
-            HDR = (
-                "  " +
-                _col("ช่อง",    CW[0]) + "  " +
-                _col("เวลารวม", CW[1], "right") + "  " +
-                _col("โกย",     CW[2], "right") + "  " +
-                _col("รอบ",     CW[3], "right") + "  " +
-                "สถานะ"
-            )
-            SEP_MAIN = "=" * (TOTAL_W + 2)
-            SEP_MID  = "  " + "─" * TOTAL_W
+    return () => {
+      console.log("Unsubscribing from /crane_status");
+      statusTopic.unsubscribe();
+    };
+  }, [ros, connected]);
 
-            print(f"\n{SEP_MAIN}")
-            print("  AUTO PROCESS — สรุปผลการทำงาน")
-            print(SEP_MAIN)
-            print(HDR)
-            print(SEP_MID)
-            for slot in [1, 2, 3]:
-                r = slot_results[slot]
-                full_tag = "เต็ม" if self._is_slot_full(slot) else "ยังไม่เต็ม"
-                scoops_str = f"{r['scoops']} ครั้ง"
-                passes_str = f"{r['passes']} รอบ"
-                print(
-                    "  " +
-                    _col(f"ช่อง {slot}",               CW[0]) + "  " +
-                    _col(self._fmt_seconds(r['time']),  CW[1], "right") + "  " +
-                    _col(scoops_str,                    CW[2], "right") + "  " +
-                    _col(passes_str,                    CW[3], "right") + "  " +
-                    full_tag
-                )
-                for pl in r["pass_log"]:
-                    p_time_str   = self._fmt_seconds(pl['time'])
-                    p_scoops_str = f"{pl['scoops']} ครั้ง"
-                    p_label      = f"  └ รอบที่ {pl['pass']:>2}"
-                    print(
-                        "  " +
-                        _col(p_label,      CW[0]) + "  " +
-                        _col(p_time_str,   CW[1], "right") + "  " +
-                        _col(p_scoops_str, CW[2], "right")
-                    )
-            print(SEP_MID)
-            total_scoops_str = f"{total_scoops} ครั้ง"
-            total_passes_str = f"{total_passes} รอบ"
-            print(
-                "  " +
-                _col("รวม",                              CW[0]) + "  " +
-                _col(self._fmt_seconds(total_elapsed),   CW[1], "right") + "  " +
-                _col(total_scoops_str,                   CW[2], "right") + "  " +
-                _col(total_passes_str,                   CW[3], "right")
-            )
-            print(f"{SEP_MAIN}\n")
+  const sendCommand = (cmd: string) => {
+    if (!connected || !webControlTopic.current) {
+      console.warn("Command skipped: Not connected");
+      return;
+    }
+    
+    console.log(">>> Sending Command:", cmd);
+    setLastSent(cmd);
 
-            self.get_logger().info("✅ [AUTO PROCESS] จบการทำงานโหมด Auto Process")
-            return True
-        finally:
-            self.cycle_running = False
+    // Use plain object structure as ROSBridge accepts it directly
+    const msg = { data: cmd }; 
+    
+    try {
+      webControlTopic.current.publish(msg as any);
+    } catch (e) {
+      console.error("Failed to publish message:", e);
+    }
+  };
 
-    # =========================================================
-    # MANUAL MODE (ปรับปรุงใหม่)
-    # - [h]         : Home แล้วพร้อม move ทันที
-    # - [m <enc>]   : เดินไปพิกัดได้ทันที (ไม่ต้อง Home ซ้ำ)
-    #                 ถ้ายังไม่เคย Home เลย → Home ก่อน 1 ครั้ง
-    # - แต่ละ m ไม่บล็อก cycle_running → m ถัดไปพิมพ์ได้ทันทีหลัง move เสร็จ
-    # =========================================================
+  const isFull = (p: any) => {
+    if (p === undefined || p === null) return false;
+    // Handle Boolean
+    if (typeof p === 'boolean') return p;
+    // Handle Number or String Number
+    const val = Number(p);
+    return val >= 1 || val > 500 || p === "true"; 
+  };
 
-    def run_homing_manual(self):
-        """[h] Home แล้วเซ็ต flag พร้อมรับ m ทันที"""
-        if not self.is_system_ready:
-            self.get_logger().warn("⚠️ [MANUAL-HOME] ระบบยังไม่พร้อม")
-            return False
-        if self.cycle_running:
-            self.get_logger().warn("⚠️ [MANUAL-HOME] Cycle กำลังทำงานอยู่ — รอก่อน")
-            return False
-        self.get_logger().info("🏠 [MANUAL-HOME] เริ่ม Homing...")
-        ok = self.do_homing(label="MANUAL-HOME")
-        if ok:
-            self._manual_homed = True
-            e1_now = self.get_e1_position()
-            self.get_logger().info(f"✅ [MANUAL-HOME] Home สำเร็จ — E1={e1_now}  พร้อมรับคำสั่ง m")
-            print(f"[MANUAL-HOME] Home สำเร็จ  E1={e1_now}  พร้อมรับ m <enc>")
-        else:
-            self.get_logger().error("❌ [MANUAL-HOME] Homing ล้มเหลว")
-        return ok
+  // Mock static profile data matching the user's image style
+  const profileData = useMemo(() => {
+    const data = [];
+    for (let i = 0; i <= 20; i += 2) {
+      // Create a nice profile curve
+      let y = 10;
+      if (i > 5) y = 10 - (i - 5) * 0.5;
+      data.push({ x: i, y: Math.max(2, y) });
+    }
+    return data;
+  }, []);
 
-    def run_manual(self, enc_target):
-        """[m <enc>] เดินไปพิกัด — ถ้ายังไม่ Home → Home ก่อน 1 ครั้ง"""
-        if not self.is_system_ready:
-            self.get_logger().warn("⚠️ [MANUAL] ระบบยังไม่พร้อม")
-            return False
-        if self.cycle_running:
-            self.get_logger().warn("⚠️ [MANUAL] Cycle กำลังทำงานอยู่ — รอก่อน")
-            return False
+  return (
+    <div className="min-h-screen liquid-bg font-sans text-black selection:bg-black selection:text-white overflow-x-hidden flex">
+      {/* Side Navigation Menu (Liquid Glass) */}
+      <motion.nav 
+        initial={false}
+        animate={isDesktop ? {
+          width: '256px',
+          height: 'auto',
+          borderRadius: '40px',
+          top: '16px',
+          left: '16px',
+          bottom: '16px',
+          padding: '24px'
+        } : {
+          width: isSidebarOpen ? '210px' : '64px',
+          height: isSidebarOpen ? '480px' : '64px',
+          borderRadius: isSidebarOpen ? '32px' : '32px',
+          top: '12px',
+          left: '12px',
+          padding: isSidebarOpen ? '16px' : '8px'
+        }}
+        transition={{ type: "spring", stiffness: 350, damping: 35 }}
+        className={cn(
+          "fixed z-[100] glass-dark shadow-2xl flex flex-col items-center xl:items-stretch overflow-hidden",
+          !isDesktop && !isSidebarOpen && "cursor-pointer hover:scale-110 active:scale-95 group/bubble",
+          !isDesktop && isSidebarOpen && "gap-4 sm:gap-6"
+        )}
+        onClick={() => {
+          if (!isDesktop && !isSidebarOpen) setIsSidebarOpen(true);
+        }}
+      >
+        {/* Logo Section */}
+        <div 
+          className={cn(
+            "flex items-center gap-3 cursor-pointer mb-2 xl:mb-0 w-full shrink-0",
+            !isDesktop && !isSidebarOpen && "justify-center h-full"
+          )} 
+          onClick={() => {
+            if (isDesktop || isSidebarOpen) {
+              setView('main');
+              if (!isDesktop) setIsSidebarOpen(false);
+            }
+          }}
+        >
+           {!isDesktop && !isSidebarOpen ? (
+             <motion.div 
+               initial={{ opacity: 0, scale: 0.8 }}
+               animate={{ opacity: 1, scale: 1 }}
+               className="text-white/80"
+             >
+               <Menu size={24} strokeWidth={3} />
+             </motion.div>
+           ) : (
+             <div className="w-10 h-10 lg:w-12 lg:h-12 flex items-center justify-center p-1 bg-white rounded-xl lg:rounded-2xl shadow-sm border border-black/5 shrink-0">
+               <img src="/logo/logo.png" alt="Logo" className="w-full h-full object-contain" />
+             </div>
+           )}
+           {(isDesktop || isSidebarOpen) && (
+             <motion.div 
+               initial={{ opacity: 0, x: -10 }}
+               animate={{ opacity: 1, x: 0 }}
+               className="flex flex-col"
+             >
+               <h1 className="text-xl font-black tracking-tighter leading-none">CraneAI</h1>
 
-        # ป้องกัน m ซ้อนกัน
-        if not self._manual_lock.acquire(blocking=False):
-            self.get_logger().warn("⚠️ [MANUAL] กำลัง move อยู่ — รอให้เสร็จก่อน")
-            return False
+             </motion.div>
+           )}
+        </div>
 
-        try:
-            enc_target = max(ENCODER_MIN, min(ENCODER_MAX, int(enc_target)))
+        {/* Navigation Items - Visible when expanded or on desktop */}
+        <AnimatePresence mode="wait">
+          {(isSidebarOpen || isDesktop) && (
+            <motion.div 
+              key="nav-items"
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="flex-1 flex flex-col gap-1.5 sm:gap-2.5 xl:gap-4 w-full mt-4 xl:mt-12 overflow-y-auto custom-scrollbar pr-1"
+            >
+              {[
+                { id: 'main', icon: Home, label: lang === 'th' ? 'หน้าหลัก' : 'OPERATION', desc: 'Control Center' },
+                { id: 'info', icon: Layout, label: lang === 'th' ? t.project_info : 'INFORMATION', desc: 'Field & Info' },
+                { id: 'gallery', icon: Image, label: lang === 'th' ? t.gallery : 'GALLERY', desc: 'Field Photos' },
+                { id: 'dev', icon: Users, label: lang === 'th' ? t.developer_page : 'DEVELOPERS', desc: 'Our Team' }
+              ].map((item) => (
+                <button
+                  key={item.id}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setView(item.id as any);
+                    if (!isDesktop) setIsSidebarOpen(false);
+                  }}
+                  className={cn(
+                    "flex items-center gap-1.5 p-2.5 xl:p-4 rounded-2xl xl:rounded-3xl transition-all relative group/item w-full shrink-0",
+                    view === item.id 
+                      ? "bg-black text-white shadow-lg xl:shadow-xl" 
+                      : "bg-transparent text-gray-400 hover:bg-black/5 hover:text-black"
+                  )}
+                >
+                  <item.icon size={20} className={cn("shrink-0 transition-transform xl:w-6 xl:h-6", view === item.id ? "scale-110" : "group-hover/item:scale-110")} />
+                  <div className={cn("flex flex-col items-start leading-none gap-0.5")}>
+                    <span className="font-black text-[11px] xl:text-xs uppercase tracking-widest leading-none">{item.label}</span>
+                  </div>
+                </button>
+              ))}
 
-            # Home ครั้งแรก (ถ้ายังไม่เคย Home)
-            if not self._manual_homed:
-                self.get_logger().info("🏠 [MANUAL] ยังไม่เคย Home — Home ก่อน 1 ครั้ง...")
-                ok = self.do_homing(label="MANUAL-AUTO-HOME")
-                if not ok:
-                    self.get_logger().error("❌ [MANUAL] Auto-Home ล้มเหลว — ยกเลิก")
-                    return False
-                self._manual_homed = True
-                time.sleep(0.3)
+              <div className="mt-auto pt-4 flex flex-col gap-2 sm:gap-3 shrink-0">
+                <button 
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setLang(lang === 'th' ? 'en' : 'th');
+                  }}
+                  className="w-full xl:px-4 py-3 rounded-2xl lg:rounded-3xl border border-black/5 bg-white shadow-sm flex items-center justify-center xl:justify-start gap-3 hover:border-black transition-all active:scale-95 group/lang"
+                >
+                  <div className="w-6 h-6 flex items-center justify-center font-black text-[10px] border border-black/10 rounded-lg bg-zinc-50 group-hover/lang:bg-black group-hover/lang:text-white transition-colors">{lang.toUpperCase()}</div>
+                  <div className={cn("flex flex-col items-start leading-none")}>
+                    <span className="font-black text-[10px] uppercase tracking-widest leading-none">{t.change_lang}</span>
+                  </div>
+                </button>
 
-            self.get_logger().info(
-                f"🚗 [MANUAL] เดินไปพิกัด E1={enc_target} "
-                f"(range {ENCODER_MIN}–{ENCODER_MAX})"
-            )
-            self._manual_moving = True
-            self.move_to_enc(enc_target, 0.0)
-            self._manual_moving = False
+                {(isDesktop || isSidebarOpen) && (
+                  <div className={cn("flex items-center gap-3 p-3 sm:p-4 bg-black/5 rounded-[24px] border border-black/5")}>
+                    <div className={cn("w-2 h-2 rounded-full", connected ? "bg-emerald-500 animate-pulse" : "bg-gray-300")} />
+                    <div className="flex flex-col leading-none">
+                      <span className="text-[8px] font-bold text-gray-400 uppercase">Status</span>
+                      <span className="text-[10px] font-black uppercase mt-1 leading-none">{connected ? "Connected" : "Offline"}</span>
+                    </div>
+                  </div>
+                )}
 
-            e1_now = self.get_e1_position()
-            self.get_logger().info(f"✅ [MANUAL] ถึงพิกัด E1={enc_target} (อ่านได้ {e1_now})")
-            print(f"[MANUAL] อยู่ที่ E1={enc_target}  (sensor={e1_now})  — พิมพ์ m <enc> เพื่อ move ต่อ")
-            return True
-        finally:
-            self._manual_moving = False
-            self._manual_lock.release()
+                {!isDesktop && isSidebarOpen && (
+                  <button 
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setIsSidebarOpen(false);
+                    }}
+                    className="w-full py-3 bg-white/5 hover:bg-white/10 rounded-2xl flex items-center justify-center text-gray-400 transition-colors"
+                  >
+                    <ChevronLeft size={20} />
+                  </button>
+                )}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </motion.nav>
 
-    def web_control_callback(self, msg):
-        cmd = msg.data.lower()
-        self.get_logger().info(f"📨 [WEB_CMD] Received: {cmd}")
-        print(f"WEB_CMD: {cmd}")
-        self.execute_command(cmd)
+      {/* Main Content Wrap */}
+      <div className={cn(
+        "flex-1 transition-all duration-500 bg-transparent h-screen overflow-y-auto overflow-x-hidden",
+        isDesktop ? "ml-64" : "ml-0",
+        (!isDesktop && isSidebarOpen) ? "blur-sm" : ""
+      )}>
+        <div className="max-w-7xl mx-auto p-3 sm:p-10 xl:p-14 pt-20 sm:pt-24 xl:pt-14 flex flex-col min-h-full items-stretch shrink-0">
+          
+          {view === 'info' ? (
+          <motion.div 
+            initial={{ opacity: 0, scale: 0.98, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            transition={{ type: "spring", damping: 25, stiffness: 120 }}
+            className="flex-1 flex flex-col pt-10"
+          >
+            <div className="flex items-center gap-6 mb-12">
+              <div className="flex gap-4">
+                <div className="w-16 h-16 sm:w-20 sm:h-20 flex items-center justify-center bg-transparent p-1">
+                  <img 
+                    src="/logo/logo.png" 
+                    alt="KMUTNB" 
+                    className="w-full h-full object-contain"
+                  />
+                </div>
+                <div className="w-16 h-16 sm:w-20 sm:h-20 flex items-center justify-center bg-transparent p-1">
+                  <img 
+                    src="/logo/logo2.png" 
+                    alt="Logo 2" 
+                    className="w-full h-full object-contain"
+                  />
+                </div>
+              </div>
+              <div>
+                <h1 className="text-2xl sm:text-4xl md:text-6xl font-black tracking-tighter leading-none mb-2">{lang === 'th' ? 'รายละเอียดโครงการ' : 'INFORMATION'}</h1>
+                <p className="text-[8px] sm:text-xs font-bold text-gray-400 tracking-tight sm:tracking-[0.2em] uppercase leading-tight">AI-Controlled Sand and Stone Preparing Machine for Concrete Batching System</p>
+              </div>
+            </div>
 
-    def execute_command(self, cmd):
-        if cmd.startswith('c') and len(cmd) > 1 and cmd[1].isdigit():
-            slot = int(cmd[1])
-            threading.Thread(target=self.run_cycle, args=(slot,), daemon=True).start()
-        elif cmd == 'x':
-            threading.Thread(target=self.run_x_cycle, daemon=True).start()
-        elif cmd == 'h':
-            # [h] Home แบบ Manual
-            threading.Thread(target=self.run_homing_manual, daemon=True).start()
-        elif cmd.startswith('m'):
-            parts = cmd[1:].strip()
-            if parts.lstrip('-').isdigit():
-                enc = int(parts)
-                # run_manual มี lock ภายใน — spawn thread ได้เลย
-                threading.Thread(target=self.run_manual, args=(enc,), daemon=True).start()
-            else:
-                self.get_logger().info(
-                    f"ℹ️ [MANUAL] ระบุพิกัด E1 ด้วย: m<enc>  เช่น m25  (range {ENCODER_MIN}-{ENCODER_MAX})"
-                )
-        elif cmd == 'reset_manual':
-            self._manual_homed = False
-            self.get_logger().info("🔄 [MANUAL] รีเซ็ต home flag — ครั้งหน้าจะ Home ก่อน")
-        elif cmd == 'ready':
-            self.get_logger().info("✅ Manual System Ready (Web Override)")
-            self.reset_state()
-            self._manual_homed = False
-            self.is_system_ready = True
-        elif cmd == 'q' or cmd == 'stop':
-            self.emergency_shutdown()
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-12">
+              <div className="space-y-8">
+                <section>
+                  <h2 className="text-xl font-black uppercase tracking-widest border-b-2 border-black pb-2 mb-4">{t.vision}</h2>
+                  <p className="text-sm leading-relaxed text-gray-600 font-medium whitespace-pre-line">
+                    {t.vision_desc}
+                  </p>
+                </section>
 
-    def udp_monitor(self):
-        while rclpy.ok():
-            try:
-                data, addr = self.listen_sock.recvfrom(1024)
-                raw_msg = data.decode(errors='ignore').strip()
-                msg = raw_msg.replace("FROM STM32:", "").strip()
-                try:
-                    msg_json = json.loads(msg) if msg.startswith('{') else {}
-                    if not msg_json:
-                        clean_text = msg.replace("DBG", "").replace("|", " ")
-                        for item in clean_text.split():
-                            item = item.strip()
-                            if ":" in item:
-                                k, v = item.split(":", 1)
-                                k = k.strip().upper()
-                                v = v.strip()
-                                try:
-                                    digits = ''.join(c for c in v if c.isdigit() or c == '-')
-                                    if digits:
-                                        msg_json[k] = int(digits)
-                                except:
-                                    pass
-                    if "EMERGENCY" in msg_json:
-                        emerg_val = int(msg_json["EMERGENCY"])
-                        threading.Thread(target=self._handle_pi_emergency, args=(emerg_val,), daemon=True).start()
-                    if "TARGET_E1" in msg_json:
-                        self.target_e1_from_cam = int(msg_json["TARGET_E1"])
-                        self.cam_target_event.set()
-                        self.get_logger().info(
-                            f"🎯 [VISION] ได้รับเป้าหมาย E1: {self.target_e1_from_cam} "
-                            f"(ROUND={msg_json.get('ROUND','?')} PCT={msg_json.get('PEAK_PCT','?')}%)"
-                        )
-                    with self._sensor_lock:
-                        if "E1"  in msg_json: self.e1_raw    = int(msg_json["E1"])
-                        if "E2"  in msg_json: self.e2_raw    = int(msg_json["E2"])
-                        if "LS1" in msg_json: self.ls1_state = int(msg_json["LS1"])
-                        if "LS2" in msg_json: self.ls2_state = int(msg_json["LS2"])
-                        self.p1 = int(msg_json.get("P1", self.p1))
-                        self.p2 = int(msg_json.get("P2", self.p2))
-                        self.p3 = int(msg_json.get("P3", self.p3))
-                        self.p4 = int(msg_json.get("P4", self.p4))
-                    with self._sensor_lock:
-                        e2_val = self.e2_raw
-                    status_msg  = String()
-                    status_data = {
-                        "p1": self.p1, "p2": self.p2, "p3": self.p3,
-                        "is_system_ready": self.is_system_ready,
-                        "is_moving": self.is_moving,
-                        "cycle_running": self.cycle_running,
-                        "last_bungkee_pos": float(self.last_bungkee_pos),
-                        "current_head_deg": float(self.current_head_deg),
-                        "yolo_danger": self.yolo_monitor.is_danger,
-                        "pi_emergency": self._pi_emergency,
-                    }
-                    status_msg.data = json.dumps(status_data)
-                    self.status_pub.publish(status_msg)
-                    if msg_json.get("START") == 1:
-                        with self._pi_emergency_lock:
-                            emerg_on = self._pi_emergency
-                        if emerg_on:
-                            self.get_logger().warn("🚨 [UDP] START ถูกบล็อก — Pi Emergency ยังทำงานอยู่!")
-                        else:
-                            self.reset_state()
-                            self.is_system_ready = True
-                    if msg_json.get("STOP") == 1:
-                        self.emergency_shutdown()
-                    if self.is_system_ready and not self.is_moving:
-                        l1, l2 = self.ls1_state, self.ls2_state
-                        arm_rad_from_e2 = (
-                            e2_to_arm_rad(e2_val) if e2_val is not None
-                            else self.last_bungkee_pos
-                        )
-                        if l1 == 1 and self._ls1_last == 0:
-                            with self._sensor_lock:
-                                self.e1_offset = self.e1_raw if self.e1_raw is not None else self.e1_offset
-                            self.smooth_pos = GAZEBO_RAD_MAX if INVERT_TWIN_ROTATION else GAZEBO_RAD_MIN
-                            self.publish_to_gazebo(self.smooth_pos, sec=0.1, arm_rad=arm_rad_from_e2)
-                            self.get_logger().info("🚩 LS1 Active: Jumping Model to LIMIT")
-                        elif l2 == 1 and self._ls2_last == 0:
-                            with self._sensor_lock:
-                                self.e1_offset = (
-                                    (self.e1_raw - ENCODER_MAX) if self.e1_raw is not None
-                                    else self.e1_offset
-                                )
-                            self.smooth_pos = GAZEBO_RAD_MIN if INVERT_TWIN_ROTATION else GAZEBO_RAD_MAX
-                            self.publish_to_gazebo(self.smooth_pos, sec=0.1, arm_rad=arm_rad_from_e2)
-                            self.get_logger().info("🚩 LS2 Active: Jumping Model to LIMIT")
-                        elif self.e1_raw is not None:
-                            current_pos = self.e1_raw - self.e1_offset
-                            target_rad  = self.calculate_mapping(current_pos)
-                            self.publish_to_gazebo(target_rad, sec=0.04, arm_rad=arm_rad_from_e2)
-                            self.last_sent_pos = target_rad
-                        self._ls1_last, self._ls2_last = l1, l2
-                except:
-                    pass
-            except socket.timeout:
-                continue
-            except Exception as e:
-                print(f"UDP Error: {e}")
+                <section>
+                  <h2 className="text-xl font-black uppercase tracking-widest border-b-2 border-black pb-2 mb-4">{t.features}</h2>
+                  <ul className="space-y-4">
+                    {[
+                      { title: lang === 'th' ? 'ระบบโทรมาตรแบบเรียลไทม์' : 'Real-time Telemetry', desc: lang === 'th' ? 'การสตรีมข้อมูลผ่าน ROSBridge (WebSockets) ที่ความหน่วงต่ำ' : 'Latency-optimized data streaming via ROSBridge (WebSockets).' },
+                      { title: lang === 'th' ? 'ระบบภาพอัจฉริยะ' : 'Smart Vision', desc: lang === 'th' ? 'การตรวจจับวัตถุด้วย AI เพื่อความแม่นยำในการยก' : 'AI-powered object detection for precision payload handling.' },
+                      { title: lang === 'th' ? 'Digital Twin' : 'Digital Twin Sync', desc: lang === 'th' ? 'การซิงโครไนซ์ระหว่างฮาร์ดแวร์จริงและโมเดลจำลอง' : 'Seamless synchronization between physical hardware and virtual simulation.' },
+                      { title: lang === 'th' ? 'ระบบความปลอดภัย' : 'Safety Protocols', desc: lang === 'th' ? 'สวิตช์จำกัดระยะและระบบเบรกฉุกเฉิน' : 'Hard-sync Limit Switches and Emergency Brake systems.' }
+                    ].map((feature, i) => (
+                      <li key={i} className="flex gap-4">
+                        <div className="w-2 h-2 rounded-full bg-black mt-2 shrink-0" />
+                        <div>
+                          <h3 className="font-black text-sm uppercase">{feature.title}</h3>
+                          <p className="text-xs text-gray-500">{feature.desc}</p>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              </div>
 
-    def emergency_shutdown(self):
-        self.is_system_ready = False
-        self.reset_state()
-        self.cycle_running = False
-        for c in ["STOP", "MAG1_OFF", "MAG2_OFF", "UP_OFF", "DOWN_OFF", "B1_OFF", "B2_OFF"]:
-            try:
-                sock.sendto(c.encode(), (PI_IP, PI_PORT))
-            except:
-                pass
-        self._stop_all_valve_repeat()
-        self.get_logger().warn("🛑 EMERGENCY STOP")
+              <div className="space-y-8">
+                 <div className="border-[4px] border-black p-8 glass relative overflow-hidden group">
+                   <div className="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
+                     <Activity size={120} />
+                   </div>
+                   <h2 className="text-2xl font-black uppercase tracking-tighter mb-4 relative z-10">{t.architecture}</h2>
+                   <div className="space-y-4 font-mono text-xs text-gray-500 relative z-10">
+                     <div className="flex justify-between border-b border-black/5 pb-2 uppercase">
+                        <span>Framework</span>
+                        <span className="text-black font-bold">React + Vite + ROS2</span>
+                     </div>
+                     <div className="flex justify-between border-b border-black/5 pb-2 uppercase">
+                        <span>Communication</span>
+                        <span className="text-black font-bold">UDP/WebSocket (9090)</span>
+                     </div>
+                     <div className="flex justify-between border-b border-black/5 pb-2 uppercase">
+                        <span>Hardware</span>
+                        <span className="text-black font-bold">Raspberry Pi + STM32</span>
+                     </div>
+                     <div className="flex justify-between border-b border-black/5 pb-2 uppercase">
+                        <span>Video Stream</span>
+                        <span className="text-black font-bold">MJPEG HTTP (5002)</span>
+                     </div>
+                   </div>
+                 </div>
 
-    def trigger_dual_brake_at_bottom(self):
-        self.is_braking_now = True
-        self.send_udp("B1_ON"); self.send_udp("B2_ON")
-        time.sleep(0.😎
-        self.send_udp("B1_OFF"); self.send_udp("B2_OFF")
-        self.brake_off_timestamp = time.time()
-        self.is_braking_now = False
+                 <div className="p-8 border-[4px] border-black glass">
+                    <h2 className="text-xl font-black uppercase tracking-widest mb-6">project CraneAI</h2>
+                    <p className="text-[10px] font-bold text-gray-400 mb-4 uppercase">AI-Controlled Sand and Stone Preparing Machine for Concrete Batching System</p>
+                    <div className="space-y-6">
+                      <div className="flex flex-col">
+                        <span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">{t.inst_label}</span>
+                        <span className="font-bold text-[10px] leading-tight">{t.inst_value}</span>
+                      </div>
+                      <div className="flex flex-col">
+                        <span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">{t.version}</span>
+                        <span className="font-bold">v0.01-beta</span>
+                      </div>
+                      <div className="pt-4 mt-4 border-t border-black/5">
+                         <button 
+                           onClick={() => setView('dev')}
+                           className="w-full py-4 bg-black text-white font-black uppercase text-[10px] tracking-widest hover:scale-[1.02] active:scale-95 transition-all shadow-xl"
+                         >
+                           VIEW ALL DEVELOPERS
+                         </button>
+                      </div>
+                    </div>
+                 </div>
+              </div>
+            </div>
+            
+          </motion.div>
+        ) : view === 'dev' ? (
+          <motion.div 
+            initial={{ opacity: 0, scale: 0.98, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            transition={{ type: "spring", damping: 25, stiffness: 120 }}
+            className="flex-1 flex flex-col pt-10"
+          >
+            <div className="flex items-center gap-6 mb-12">
+              <div className="flex gap-4">
+                <div className="w-16 h-16 sm:w-20 sm:h-20 flex items-center justify-center bg-transparent p-1">
+                  <img 
+                    src="/logo/logo.png" 
+                    alt="KMUTNB" 
+                    className="w-full h-full object-contain"
+                  />
+                </div>
+                <div className="w-16 h-16 sm:w-20 sm:h-20 flex items-center justify-center bg-transparent p-1">
+                  <img 
+                    src="/logo/logo2.png" 
+                    alt="Logo 2" 
+                    className="w-full h-full object-contain"
+                  />
+                </div>
+              </div>
+              <div>
+                <h1 className="text-2xl sm:text-4xl md:text-6xl font-black tracking-tighter leading-none mb-2">{t.team}</h1>
+                <p className="text-[8px] sm:text-xs font-bold text-gray-400 tracking-tight sm:tracking-[0.1em] uppercase leading-tight">King Mongkut's University of Technology North Bangkok</p>
+              </div>
+            </div>
 
-    def trigger_single_brake_at_top_and_resume(self):
-        self.is_braking_now = True
-        self.send_udp("B1_ON"); time.sleep(0.8); self.send_udp("B1_OFF")
-        if self.bungkee_cmd == "UP":
-            self.send_udp("UP_ON")
-        self.brake_off_timestamp = time.time()
-        self.is_braking_now = False
+            <div className="max-w-4xl mx-auto w-full px-2 sm:px-0">
+               <div className="p-6 sm:p-14 border-[6px] sm:border-[10px] border-black bg-black/90 backdrop-blur-xl text-white shadow-[15px_15px_0px_0px_rgba(0,0,0,0.1)] sm:shadow-[30px_30px_0px_0px_rgba(0,0,0,0.1)] rounded-sm">
+                  {/* Advisor Section */}
+                  <div className="flex flex-col items-center mb-16 pb-16 border-b border-white/10">
+                      <div className="w-32 h-32 sm:w-40 sm:h-40 rounded-full border-8 border-white overflow-hidden bg-gray-800 shrink-0 mb-6 shadow-2xl">
+                         <img src="/person/person0.jpg" alt="Advisor" className="w-full h-full object-cover" onError={(e) => (e.target as HTMLImageElement).src = `https://api.dicebear.com/7.x/avataaars/svg?seed=advisor`} />
+                      </div>
+                      <div className="flex flex-col items-center">
+                         <span className="text-xs sm:text-sm font-black text-[#22c55e] uppercase tracking-[0.4em] mb-3">{lang === 'th' ? 'อาจารย์ที่ปรึกษา' : 'PROJECT ADVISOR'}</span>
+                         <span className="font-black text-2xl sm:text-4xl tracking-tight text-white text-center">ผศ.ดร.สุพจน์ แก้วกรณ์</span>
+                         <span className="text-[10px] font-bold text-gray-500 uppercase mt-4 tracking-widest">{t.inst_value}</span>
+                      </div>
+                   </div>
 
-    def joint_callback(self, msg):
-        try:
-            idx     = msg.name.index('headcrane_Link')
-            new_deg = math.degrees(msg.position[idx])
-            idx2    = msg.name.index('armcrane_Link')
-            bungkee_pos = msg.position[idx2]
-            if not self.system_started or not self.is_moving or not self.is_system_ready or self.is_braking_now:
-                self.current_head_deg = new_deg
-                self.last_bungkee_pos = bungkee_pos
-                return
-            diff = new_deg - self.current_head_deg
-            if INVERT_TWIN_ROTATION:
-                diff = -diff
-            if abs(diff) > 0.05 and (time.time() - self.brake_off_timestamp) >= 0.8:
-                if diff > 0.1:
-                    if self.last_cmd != "MAG2":
-                        self.send_udp("MAG2_ON"); self.send_udp("MAG1_OFF"); self.last_cmd = "MAG2"
-                elif diff < -0.1:
-                    if self.last_cmd != "MAG1":
-                        self.send_udp("MAG1_ON"); self.send_udp("MAG2_OFF"); self.last_cmd = "MAG1"
-                self.current_head_deg = new_deg
-            diff_b  = bungkee_pos - self.last_bungkee_pos
-            cur_dir = "UP" if diff_b > 0.001 else "DOWN" if diff_b < -0.001 else None
-            if cur_dir and cur_dir != self.bungkee_cmd and (time.time() - self.cmd_timestamp) > 0.1:
-                self.send_udp(f"{cur_dir}_ON")
-                self.send_udp(f"{'UP' if cur_dir=='DOWN' else 'DOWN'}_OFF")
-                self.bungkee_cmd = cur_dir
-                self.cmd_timestamp = time.time()
-            if bungkee_pos >= -0.01 and self.bungkee_cmd == "UP" and not self.brake_triggered:
-                self.send_udp("UP_OFF"); self.brake_triggered = True
-            elif bungkee_pos <= -0.99 and self.bungkee_cmd == "DOWN" and not self.brake_triggered:
-                self.send_udp("DOWN_OFF")
-                threading.Thread(target=self.trigger_dual_brake_at_bottom, daemon=True).start()
-                self.brake_triggered = True
-            self.last_bungkee_pos = bungkee_pos
-        except:
-            pass
+                   {/* Teams Grid */}
+                   <div className="grid grid-cols-1 md:grid-cols-2 gap-16 sm:gap-24">
+                      {/* Team A */}
+                      <div className="space-y-8">
+                         <div className="flex justify-between items-end border-b border-white/20 pb-4 mb-2">
+                           <h3 className="text-lg font-black tracking-widest text-[#22c55e] uppercase">TEAM SOFTWARE</h3>
+                         </div>
+                         {[
+                            { name: "นายโชคพิพัฒน์ ดิษฐ์เลิศธนกุล", img: "/person/person1.png" },
+                            { name: "นายณัฐวุฒิ ศรีอ่อน", img: "/person/person2.png" },
+                            { name: "นายเจนกวิน ย่านสากล", img: "/person/person3.png" }
+                         ].map((member, i) => (
+                            <div key={i} className="flex items-center gap-6 group">
+                               <div className="w-16 h-16 sm:w-20 sm:h-20 rounded-full border-4 border-white/20 overflow-hidden bg-gray-800 shrink-0 transition-transform group-hover:scale-110">
+                                  <img src={member.img} alt={member.name} className="w-full h-full object-cover" onError={(e) => (e.target as HTMLImageElement).src = `https://api.dicebear.com/7.x/avataaars/svg?seed=a${i}`} />
+                               </div>
+                               <div className="flex flex-col">
+                                  <span className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1">DEVELOPER</span>
+                                  <span className="font-black text-base sm:text-lg leading-tight text-white">{member.name}</span>
+                               </div>
+                            </div>
+                         ))}
+                      </div>
 
-    def move(self, head_deg, bungkee=0.0):
-        if not self.is_system_ready:
-            return
-        self.is_moving = True
-        diff_deg = head_deg - self.current_head_deg
-        if INVERT_TWIN_ROTATION:
-            diff_deg = -diff_deg
-        self.bungkee_active  = (bungkee != 0.0)
-        self.last_bungkee_pos = float(bungkee)
-        target_rad  = math.radians(head_deg)
-        dist_rad    = abs(target_rad - math.radians(self.current_head_deg))
-        travel_sec  = max(0.4, dist_rad * 0.5)
-        self.publish_to_gazebo(target_rad, sec=travel_sec)
-        time.sleep(travel_sec)
-        self.is_moving = False
-        self.send_udp("MAG1_OFF"); self.send_udp("MAG2_OFF")
+                      {/* Team B */}
+                      <div className="space-y-8">
+                         <div className="flex justify-between items-end border-b border-white/20 pb-4 mb-2">
+                           <h3 className="text-lg font-black tracking-widest text-[#22c55e] uppercase">TEAM HARDWARE</h3>
+                         </div>
+                         {[
+                            { name: "นายจูเลี่ยน ประเสริฐ", img: "/person/person4.jpg" },
+                            { name: "นายอนุพันธ์ ท้วมวงศ์", img: "/person/person5.jpg" },
+                            { name: "นายภัทรพล แสงคำ", img: "/person/person6.jpg" }
+                         ].map((member, i) => (
+                            <div key={i} className="flex items-center gap-6 group">
+                               <div className="w-16 h-16 sm:w-20 sm:h-20 rounded-full border-4 border-white/20 overflow-hidden bg-gray-800 shrink-0 transition-transform group-hover:scale-110">
+                                  <img src={member.img} alt={member.name} className="w-full h-full object-cover" onError={(e) => (e.target as HTMLImageElement).src = `https://api.dicebear.com/7.x/avataaars/svg?seed=b${i}`} />
+                               </div>
+                               <div className="flex flex-col">
+                                  <span className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1">DEVELOPER</span>
+                                  <span className="font-black text-base sm:text-lg leading-tight text-white">{member.name}</span>
+                               </div>
+                            </div>
+                         ))}
+                      </div>
+                   </div>
 
-    def enc_to_deg(self, enc_pos):
-        return math.degrees(self.encoder_to_rad(enc_pos))
+                   {/* Footer Quote */}
+                   <div className="mt-20 pt-10 border-t border-white/10 text-center italic text-gray-500 text-xs">
+                     "Automating the physical world through code and intelligence."
+                   </div>
+               </div>
+            </div>
+          </motion.div>
+        ) : view === 'gallery' ? (
+          <motion.div 
+            initial={{ opacity: 0, scale: 0.98, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            transition={{ type: "spring", damping: 25, stiffness: 120 }}
+            className="flex-1 flex flex-col pt-10"
+          >
+            <div className="flex items-center gap-6 mb-12">
+              <div className="flex gap-4">
+                <div className="w-16 h-16 sm:w-20 sm:h-20 flex items-center justify-center bg-transparent p-1">
+                  <img 
+                    src="/logo/logo.png" 
+                    alt="KMUTNB" 
+                    className="w-full h-full object-contain"
+                  />
+                </div>
+                <div className="w-16 h-16 sm:w-20 sm:h-20 flex items-center justify-center bg-transparent p-1">
+                  <img 
+                    src="/logo/logo2.png" 
+                    alt="Logo 2" 
+                    className="w-full h-full object-contain"
+                  />
+                </div>
+              </div>
+              <div>
+                <h1 className="text-2xl sm:text-4xl md:text-6xl font-black tracking-tighter leading-none mb-2">{lang === 'th' ? 'แกลเลอรี่โครงการ' : 'GALLERY'}</h1>
+                <p className="text-[8px] sm:text-xs font-bold text-gray-400 tracking-tight sm:tracking-[0.1em] uppercase leading-tight">Visual Field Documentation & Progress</p>
+              </div>
+            </div>
 
-    def move_to_enc(self, enc_target, bungkee=0.0):
-        self.move(self.enc_to_deg(enc_target), bungkee)
-        self.get_logger().info(f"🔄 [SYNC] E1: {enc_target}...")
-        timeout_start = time.time()
-        while rclpy.ok() and self.is_system_ready:
-            if not self._wait_if_paused("MOVE_TO_ENC"):
-                break
-            if abs(enc_target - self.get_e1_position()) <= 0 or (time.time() - timeout_start) > 12.0:
-                break
-            diff = enc_target - self.get_e1_position()
-            self.send_udp("MAG2_ON" if diff > 0 else "MAG1_ON")
-            self.send_udp("MAG1_OFF" if diff > 0 else "MAG2_OFF")
-            time.sleep(0.02)
-        self.send_udp("MAG1_OFF"); self.send_udp("MAG2_OFF")
-        self.last_cmd = "STOP"
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4 sm:gap-6">
+                {[
+                  '665108993_1347049720620889_3942740309544427124_n.jpg',
+                  '665193417_999804972999397_3779305772829628182_n.jpg',
+                  '665797994_1313230597432721_7401155319504346035_n.jpg',
+                  '668813309_2829730480719380_7201648612407399436_n.jpg',
+                  '668813309_864421445958429_3997512588218532495_n.jpg',
+                  '668842994_1344199257766283_2498898871718563839_n.jpg',
+                  '669364869_2442180749560862_3721912035129363699_n.jpg',
+                  '669375449_984555490888724_3070797389505805262_n.jpg',
+                  '671153151_1441748457703166_92581223828938756_n.jpg',
+                  '671366609_1920251345317180_512938661228880599_n.jpg',
+                  '671517031_1360150942599307_3759236595094922638_n.jpg',
+                  '671603281_974973031585471_7547218204159348625_n.jpg',
+                  '671680112_1696589761474792_4218581411384078930_n.jpg',
+                  '671783058_26895953406681220_1962940762018238454_n.jpg',
+                  '672115680_3935619596743529_968607634762429723_n.jpg',
+                  '672165765_2910215725990618_8670062747554425318_n.jpg',
+                  '672183096_1319477220316927_6381103252807740233_n.jpg',
+                  '672240746_2211031805969833_929798505854476953_n.jpg',
+                  '672578346_1551345343280840_4231644091340028203_n.jpg',
+                  '673010871_1504053891119446_8493092311875826839_n.jpg',
+                  '673436824_2185605768642651_5291520371103803663_n.jpg',
+                  '673468747_1458064508938753_8139284388626675147_n.jpg',
+                  '674330311_1998576460778245_4277346437431074588_n.jpg',
+                  '674338686_1312012867539109_7473594028563883505_n.jpg',
+                  '674941786_1892342564785202_4338253602076522691_n.jpg',
+                  '676427031_985941390560746_1373793281664596488_n.jpg',
+                  '677041072_1679415693091803_5630998944295851038_n.jpg',
+                  '684185208_1679960263224651_9108961494422427282_n.jpg',
+                  '686354663_1350465487004220_544609828601504527_n.jpg',
+                  '687872246_984533117271653_2137492318346047025_n.jpg',
+                  '687892215_972787482281266_731855086472239926_n.jpg',
+                  '687955674_1295341545860612_8770291544624223411_n.jpg',
+                  '687979406_972440885714422_2019849779191540807_n.jpg',
+                  '688013363_969021302404436_4773491481150027016_n.jpg',
+                  '688047343_1449854409800817_7416815562721035033_n.jpg',
+                  '688137770_1332618678931922_3176833776631251841_n.jpg',
+                  '688501667_959280206997868_7230136938615155063_n.jpg',
+                  '689608909_1630848151319613_7493825178660962171_n.jpg',
+                  '691483141_27905760682346467_8527996212161507271_n.jpg',
+                  '692842891_1018716660842227_946711966078317824_n.jpg',
+                  '693343436_1288531573368454_5501628118450964247_n.jpg',
+                  '693467086_1619802243225957_4733870540036968289_n.jpg',
+                  '693546648_1661808848488235_1481415623159307185_n.jpg',
+                  '693612053_1737186924324788_2705795435741237184_n.jpg',
+                  '694532861_1714275083317896_1572283592904312342_n.jpg',
+                  '695532404_954582227558737_2121059039702243983_n.jpg',
+                  '695685653_1351221640184954_5605973137035462505_n.jpg',
+                  '695823947_1700329040968748_8504208513306902535_n.jpg',
+                  '696187427_966540376081365_1218022910700932098_n.jpg',
+                  '696195646_1699180797741902_5714024066754859541_n.jpg',
+                  '701220434_1279746097664390_6557688673590458890_n.jpg'
+                ].map((img, i) => (
+                  <motion.div 
+                    key={i}
+                    whileHover={{ scale: 1.02 }}
+                    onClick={() => setSelectedImage(`/GALLERY/${img}`)}
+                    className="aspect-square border-[3px] border-black overflow-hidden bg-gray-100 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] hover:shadow-[8px_8px_0px_0px_rgba(0,0,0,1)] transition-all cursor-zoom-in"
+                  >
+                    <img 
+                      src={`/GALLERY/${img}`} 
+                      alt={`Field image ${i + 1}`} 
+                      className="w-full h-full object-cover"
+                      loading="lazy"
+                    />
+                  </motion.div>
+                ))}
+              </div>
+          </motion.div>
+        ) : (
+          <motion.div 
+            initial={{ opacity: 0, scale: 0.98, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            transition={{ type: "spring", damping: 25, stiffness: 120 }}
+            className="flex-1 flex flex-col"
+          >
+            {/* Top Header Section */}
+        <div className="flex flex-col lg:flex-row justify-between items-center lg:items-start w-full mb-10 gap-8">
+          <div className="flex flex-col items-center lg:items-start gap-4 w-full lg:w-auto">
+            <div className="flex items-center gap-4">
+              <div className="flex gap-3">
+                <div className="w-14 h-14 sm:w-16 sm:h-16 flex items-center justify-center bg-transparent p-1">
+                  <img 
+                    src="/logo/logo.png" 
+                    alt="KMUTNB" 
+                    className="w-full h-full object-contain"
+                  />
+                </div>
+                <div className="w-14 h-14 sm:w-16 sm:h-16 flex items-center justify-center bg-transparent p-1">
+                  <img 
+                    src="/logo/logo2.png" 
+                    alt="Logo 2" 
+                    className="w-full h-full object-contain"
+                  />
+                </div>
+              </div>
+              <div className="flex flex-col">
+                <h1 className="text-2xl sm:text-3xl font-black tracking-tighter leading-none">CraneAI</h1>
+                <span className="text-[8px] sm:text-[10px] font-bold text-gray-400 tracking-[0.1em] uppercase mt-1">King Mongkut's University of Technology North Bangkok.</span>
+              </div>
+            </div>
+          </div>
+          
+          <div className="flex flex-col items-center lg:items-end gap-2 w-full lg:w-auto mt-4 lg:mt-0">
+            <div className="flex items-center gap-3 sm:gap-4 w-full justify-center lg:justify-end">
+              <div className="flex items-center glass border border-black/10 rounded-lg p-1 shadow-sm gap-1 sm:gap-2 w-full max-w-sm sm:max-w-md lg:w-auto">
+                <input 
+                  type="text" 
+                  value={wsUrl}
+                  onChange={(e) => setWsUrl(e.target.value)}
+                  className="bg-transparent px-2 sm:px-3 py-2 font-mono text-[9px] sm:text-[11px] outline-none flex-1 min-w-0"
+                  placeholder="ws://localhost:9090"
+                />
+                <div className="h-4 w-[1px] bg-gray-200 mx-0.5 sm:mx-1" />
+                <button 
+                  onClick={connected ? () => ros?.close() : connect}
+                  className={cn(
+                    "px-2 sm:px-6 py-2 font-black text-[9px] sm:text-[11px] uppercase tracking-widest transition-all whitespace-nowrap",
+                    connected ? "text-rose-500 hover:bg-rose-50" : "text-blue-600 hover:bg-blue-50"
+                  )}
+                >
+                  {connected ? t.disconnect : t.connect}
+                </button>
+              </div>
+            </div>
+            {error && (
+              <span className="text-[9px] font-bold text-rose-500 uppercase tracking-wider text-center lg:text-right">
+                {error}
+              </span>
+            )}
+          </div>
+        </div>
+
+      {/* Main Content Area */}
+        <div className="flex-1 flex flex-col gap-6 lg:gap-10 xl:gap-14 w-full">
+          
+          <div className="w-full flex flex-col lg:grid lg:grid-cols-12 gap-6 lg:gap-10 xl:gap-14 items-center lg:items-start shrink-0">
+            
+            {/* Left Side: Display */}
+            <div className="w-full col-span-12 lg:col-span-8 flex flex-col gap-4 items-center lg:items-stretch h-full">
+              <div className="w-full aspect-video border-[3px] sm:border-[5px] border-black rounded-sm flex items-center justify-center bg-transparent glass relative shadow-[4px_4px_0px_0px_rgba(0,0,0,0.05)] sm:shadow-[10px_10px_0px_0px_rgba(0,0,0,0.05)] max-w-full lg:max-w-none overflow-hidden mx-auto lg:mx-0 max-h-[60vh] lg:max-h-none">
+                 {/* Live Video Feed */}
+                 <img 
+                   src={videoUrl} 
+                   alt="Live Crane Feed"
+                   className="w-full h-full object-contain bg-black"
+                   onError={(e) => {
+                     (e.target as HTMLImageElement).style.display = 'none';
+                     const parent = (e.target as HTMLImageElement).parentElement;
+                     if (parent) {
+                       const fallback = parent.querySelector('.video-fallback');
+                       if (fallback) (fallback as HTMLElement).style.display = 'flex';
+                     }
+                   }}
+                 />
+
+                  {/* Video Fallback UI */}
+                  <div className="video-fallback hidden absolute inset-0 flex-col items-center justify-center gap-2 p-4">
+                    <span className="text-emerald-500 text-[12vw] sm:text-6xl md:text-8xl font-black uppercase tracking-[0.1em] sm:tracking-[0.3em] opacity-40 text-center">{t.display}</span>
+                    <div className="text-[8px] sm:text-[12px] font-bold text-gray-400 uppercase tracking-[0.1em] sm:tracking-[0.4em] bg-white/80 px-2 sm:px-4 py-1 sm:py-2 rounded text-center">
+                      {t.waiting_signal}
+                    </div>
+                  </div>
+
+                 {/* Simple Live Data Overlay */}
+                 <div className="absolute top-4 right-4 sm:top-8 sm:right-8 flex flex-col items-end font-mono text-[9px] sm:text-[12px] text-gray-400 glass p-2 sm:p-4 rounded-sm border border-black/5 shadow-sm">
+                   <div className="font-bold flex items-center gap-1 sm:gap-3 text-black mb-0.5 sm:mb-1">
+                     <div className={cn("w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full", connected ? "bg-red-500 animate-pulse" : "bg-gray-300")} />
+                     LIVE_FEED
+                   </div>
+                   <div className="font-bold opacity-60">AZIM: {craneState.current_head_deg.toFixed(1)}°</div>
+                   <div className="font-bold opacity-60">BOOM: {craneState.last_bungkee_pos.toFixed(2)}</div>
+                 </div>
+              </div>
+            </div>
+
+            {/* Right Side: Status Indicators */}
+            <div className="col-span-12 lg:col-span-4 flex flex-col items-center w-full pt-1 sm:pt-4">
+              <h2 className="text-xl sm:text-2xl xl:text-3xl font-black uppercase tracking-[0.1em] xl:tracking-[0.2em] text-[#1a1a1a] mb-4 xl:mb-12 text-center">{t.status}</h2>
+              
+              <div className="grid grid-cols-3 gap-x-2 sm:gap-x-4 lg:gap-x-8 xl:gap-x-12 gap-y-4 lg:gap-y-10 xl:gap-y-16 w-full max-w-sm lg:max-w-none justify-items-center">
+                 {/* P1 Pair */}
+                 <div className="flex flex-col items-center gap-2 sm:gap-3 xl:gap-12">
+                   <div className="flex flex-col items-center gap-1 xl:gap-4">
+                     <span className="text-[10px] sm:text-[13px] font-black text-gray-400 tracking-wider uppercase">{t.full}</span>
+                     <div className={cn(
+                       "w-8 h-8 sm:w-10 sm:h-10 lg:w-16 lg:h-16 xl:w-24 xl:h-24 rounded-full border-[3px] sm:border-[4px] border-black transition-all duration-700",
+                       isFull(craneState.p1) 
+                         ? "bg-[#22c55e] scale-110 shadow-[0_0_30px_rgba(34,197,94,0.3)]" 
+                         : "bg-white shadow-inner"
+                     )} />
+                   </div>
+                   <div className="flex flex-col items-center gap-1 xl:gap-4">
+                     <div className={cn(
+                       "w-8 h-8 sm:w-10 sm:h-10 lg:w-16 lg:h-16 xl:w-24 xl:h-24 rounded-full border-[3px] sm:border-[4px] border-black transition-all duration-700",
+                       !isFull(craneState.p1) 
+                         ? "bg-[#ef4444] scale-110 shadow-[0_0_30px_rgba(239,68,68,0.3)]" 
+                         : "bg-white shadow-inner"
+                     )} />
+                     <span className="text-[10px] sm:text-[13px] font-black text-gray-400 tracking-wider uppercase">{t.empty}</span>
+                   </div>
+                 </div>
+
+                 {/* P2 Pair */}
+                 <div className="flex flex-col items-center gap-2 sm:gap-3 xl:gap-12">
+                   <div className="flex flex-col items-center gap-1 xl:gap-4">
+                     <span className="text-[10px] sm:text-[13px] font-black text-gray-400 tracking-wider uppercase">{t.full}</span>
+                     <div className={cn(
+                       "w-8 h-8 sm:w-10 sm:h-10 lg:w-16 lg:h-16 xl:w-24 xl:h-24 rounded-full border-[3px] sm:border-[4px] border-black transition-all duration-700",
+                       isFull(craneState.p2) 
+                         ? "bg-[#22c55e] scale-110 shadow-[0_0_30px_rgba(34,197,94,0.3)]" 
+                         : "bg-white shadow-inner"
+                     )} />
+                   </div>
+                   <div className="flex flex-col items-center gap-1 xl:gap-4">
+                     <div className={cn(
+                       "w-8 h-8 sm:w-10 sm:h-10 lg:w-16 lg:h-16 xl:w-24 xl:h-24 rounded-full border-[3px] sm:border-[4px] border-black transition-all duration-700",
+                       !isFull(craneState.p2) 
+                         ? "bg-[#ef4444] scale-110 shadow-[0_0_30px_rgba(239,68,68,0.3)]" 
+                         : "bg-white shadow-inner"
+                     )} />
+                     <span className="text-[10px] sm:text-[13px] font-black text-gray-400 tracking-wider uppercase">{t.empty}</span>
+                   </div>
+                 </div>
+
+                 {/* P3 Pair */}
+                 <div className="flex flex-col items-center gap-2 sm:gap-3 xl:gap-12">
+                   <div className="flex flex-col items-center gap-1 xl:gap-4">
+                     <span className="text-[10px] sm:text-[13px] font-black text-gray-400 tracking-wider uppercase">{t.full}</span>
+                     <div className={cn(
+                       "w-8 h-8 sm:w-10 sm:h-10 lg:w-16 lg:h-16 xl:w-24 xl:h-24 rounded-full border-[3px] sm:border-[4px] border-black transition-all duration-700",
+                       isFull(craneState.p3) 
+                         ? "bg-[#22c55e] scale-110 shadow-[0_0_30px_rgba(34,197,94,0.3)]" 
+                         : "bg-white shadow-inner"
+                     )} />
+                   </div>
+                   <div className="flex flex-col items-center gap-1 xl:gap-4">
+                     <div className={cn(
+                       "w-8 h-8 sm:w-10 sm:h-10 lg:w-16 lg:h-16 xl:w-24 xl:h-24 rounded-full border-[3px] sm:border-[4px] border-black transition-all duration-700",
+                       !isFull(craneState.p3) 
+                         ? "bg-[#ef4444] scale-110 shadow-[0_0_30px_rgba(239,68,68,0.3)]" 
+                         : "bg-white shadow-inner"
+                     )} />
+                     <span className="text-[10px] sm:text-[13px] font-black text-gray-400 tracking-wider uppercase">{t.empty}</span>
+                   </div>
+                 </div>
+               </div>
+            </div>
+          </div>
+
+          {/* Bottom Control Section */}
+          <div className="flex flex-col lg:grid lg:grid-cols-12 gap-6 lg:gap-10 xl:gap-14 w-full items-center lg:items-start shrink-0 mb-8 sm:mb-0">
+            {/* Round Controls */}
+            <div className="col-span-12 lg:col-span-8 flex flex-col gap-4 sm:gap-12 items-center lg:items-stretch w-full">
+               <div className="flex flex-col sm:flex-row justify-around items-center gap-6 sm:gap-10 w-full">
+                  {/* STOP */}
+                  <div className="flex flex-col items-center gap-2 sm:gap-6">
+                     <span className="text-[10px] sm:text-[13px] font-black uppercase tracking-widest text-[#ef4444]">STOP [Q]</span>
+                     <button 
+                       onClick={() => sendCommand('q')}
+                       disabled={!connected}
+                       className={cn(
+                         "w-24 h-24 sm:w-40 sm:h-40 rounded-full bg-transparent border-[6px] sm:border-[12px] flex items-center justify-center group relative transition-all active:scale-95 shadow-sm",
+                         craneState.is_system_ready 
+                          ? "border-[#ef4444] bg-[#ef4444]/5 shadow-[0_0_30px_rgba(239,68,68,0.2)]" 
+                          : "border-black/10"
+                       )}
+                     >
+                       <div className="absolute inset-1 sm:inset-2 rounded-full border-[2px] sm:border-[4px] border-black/5" />
+                       <span className={cn(
+                         "font-black text-lg sm:text-2xl tracking-tighter transition-colors",
+                         craneState.is_system_ready ? "text-[#ef4444]" : "text-gray-300 group-hover:text-[#ef4444]"
+                       )}>STOP</span>
+                     </button>
+                  </div>
+
+                  {/* AUTO */}
+                  <div className="flex flex-col items-center gap-2 sm:gap-6">
+                     <span className="text-[10px] sm:text-[13px] font-black uppercase tracking-widest text-[#22c55e]">AUTO [X]</span>
+                     <button 
+                       onClick={() => sendCommand('x')}
+                       disabled={!connected}
+                       className={cn(
+                         "w-24 h-24 sm:w-40 sm:h-40 rounded-full bg-transparent border-[6px] sm:border-[12px] flex items-center justify-center group relative transition-all active:scale-95 shadow-sm",
+                         craneState.is_system_ready 
+                          ? "border-[#22c55e] bg-[#22c55e]/5 shadow-[0_0_30px_rgba(34,197,94,0.2)]" 
+                          : "border-black/10"
+                       )}
+                     >
+                       <div className="absolute inset-1 sm:inset-2 rounded-full border-[2px] sm:border-[4px] border-black/5" />
+                       <span className={cn(
+                         "font-black text-lg sm:text-2xl tracking-tighter transition-colors",
+                         craneState.is_system_ready ? "text-[#22c55e]" : "text-gray-300 group-hover:text-[#22c55e]"
+                       )}>AUTO</span>
+                     </button>
+                  </div>
+
+                  {/* HOME */}
+                  <div className="flex flex-col items-center gap-2 sm:gap-6">
+                     <span className="text-[10px] sm:text-[13px] font-black uppercase tracking-widest text-[#0ea5e9]">HOME [H]</span>
+                     <button 
+                       onClick={() => sendCommand('h')}
+                       disabled={!connected}
+                       className={cn(
+                         "w-24 h-24 sm:w-40 sm:h-40 rounded-full bg-transparent border-[6px] sm:border-[12px] flex items-center justify-center group relative transition-all active:scale-95 shadow-sm",
+                         craneState.is_system_ready 
+                          ? "border-[#0ea5e9] bg-[#0ea5e9]/5 shadow-[0_0_30px_rgba(14,165,233,0.2)]" 
+                          : "border-black/10"
+                       )}
+                     >
+                       <div className="absolute inset-1 sm:inset-2 rounded-full border-[2px] sm:border-[4px] border-black/5" />
+                       <span className={cn(
+                         "font-black text-lg sm:text-2xl tracking-tighter transition-colors",
+                         craneState.is_system_ready ? "text-[#0ea5e9]" : "text-gray-300 group-hover:text-[#0ea5e9]"
+                       )}>HOME</span>
+                     </button>
+                  </div>
+               </div>
+
+               {/* Start Program Buttons */}
+               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 sm:gap-8 px-4 w-full justify-center">
+                  <button onClick={() => sendCommand('c1')} disabled={!connected} className="py-5 glass border-[4px] border-black shadow-[8px_8px_0px_0px_rgba(0,0,0,0.1)] font-black uppercase text-[10px] sm:text-xs tracking-widest hover:translate-y-[-2px] hover:shadow-[12px_12px_0px_0px_rgba(0,0,0,0.05)] transition-all active:translate-y-[2px] active:shadow-none w-full rounded-3xl text-black">START PROGRAM 1</button>
+                  <button onClick={() => sendCommand('c2')} disabled={!connected} className="py-5 glass border-[4px] border-black shadow-[8px_8px_0px_0px_rgba(0,0,0,0.1)] font-black uppercase text-[10px] sm:text-xs tracking-widest hover:translate-y-[-2px] hover:shadow-[12px_12px_0px_0px_rgba(0,0,0,0.05)] transition-all active:translate-y-[2px] active:shadow-none w-full rounded-3xl text-black">START PROGRAM 2</button>
+                  <button onClick={() => sendCommand('c3')} disabled={!connected} className="py-5 glass border-[4px] border-black shadow-[8px_8px_0px_0px_rgba(0,0,0,0.1)] font-black uppercase text-[10px] sm:text-xs tracking-widest hover:translate-y-[-2px] hover:shadow-[12px_12px_0px_0px_rgba(0,0,0,0.05)] transition-all active:translate-y-[2px] active:shadow-none w-full rounded-3xl text-black">START PROGRAM 3</button>
+               </div>
+            </div>
+
+            {/* Right Side Logs */}
+            <div className="col-span-12 lg:col-span-4 flex flex-col self-stretch w-full">
+               <div className="flex-1 w-full border-[6px] sm:border-[8px] border-black rounded-3xl glass p-3 sm:p-8 relative shadow-[8px_8px_0px_0px_rgba(0,0,0,0.05)] sm:shadow-[12px_12px_0px_0px_rgba(0,0,0,0.05)] flex flex-col min-h-[300px] sm:min-h-[400px] overflow-hidden">
+                  <span className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-black/5 text-lg sm:text-2xl lg:text-3xl font-black uppercase tracking-[0.1em] sm:tracking-[0.2em] whitespace-nowrap select-none">{t.text_alarm}</span>
+                  
+                  <div className="relative z-10 h-full flex flex-col">
+                    <div className="text-gray-300 italic mb-3 sm:mb-6 select-none border-b border-black/5 pb-2 flex justify-between uppercase font-mono text-[9px] sm:text-[10px] tracking-widest">
+                      <span>-- telemetry broadcast --</span>
+                      {lastReceivedTime && (
+                        <span className={cn(
+                          "not-italic font-bold",
+                          Date.now() - lastReceivedTime > 2000 ? "text-rose-500" : "text-emerald-500"
+                        )}>
+                          {Math.round((Date.now() - lastReceivedTime) / 1000)}s AGO
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-4 mb-4">
+                       <div className="flex flex-col bg-gray-50 p-4 border border-black/5">
+                          <span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1">System Mode</span>
+                          <span className={cn(
+                            "font-black text-sm uppercase",
+                            craneState.is_system_ready ? "text-emerald-600" : "text-black"
+                          )}>
+                            {craneState.is_system_ready ? "STABLE" : "WAITING"}
+                          </span>
+                       </div>
+                       <div className="flex flex-col bg-gray-50 p-4 border border-black/5">
+                          <span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1">Motion Status</span>
+                          <span className="font-black text-sm uppercase">{craneState.is_moving ? "IN MOTION" : "STABLE"}</span>
+                       </div>
+                    </div>
 
 
-def main():
-    rclpy.init()
-    node = CraneIntegratedSystem()
-    threading.Thread(target=rclpy.spin, args=(node,), daemon=True).start()
-    try:
-        while rclpy.ok():
-            if not node.is_system_ready:
-                with node._pi_emergency_lock:
-                    emerg_on = node._pi_emergency
-                if emerg_on:
-                    print("\r🚨 Pi EMERGENCY active — กด GPIO16 ค้างอยู่ รอปล่อยก่อน...", end="")
-                else:
-                    print("\r⏳ Waiting START from Pi...", end="")
-                time.sleep(0.5)
-                continue
 
-            print(f"\n--- TWIN SYNC PRO --- [P1:{node.p1} P2:{node.p2} P3:{node.p3}]")
-            print("[c1-c3] Cycle | [x] Auto Process")
-            print("[h] Home  |  [m <E1>] Manual move  (เช่น m25 หรือ m 25)")
-            print("[reset_manual] รีเซ็ต home flag  |  [q] Quit")
-            raw = input("เลือกคำสั่ง: ").strip().lower()
+                        {/* ── DATA DISPLAY AREA ── */}
+                        <div className="mt-auto">
+                          <div className="flex items-center justify-between mb-2">
+                            <span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">
+                              {showSummary && lastSummary ? "LAST PROCESS SUMMARY" : "RAW STREAM DATA"}
+                            </span>
+                            <div className="flex gap-2">
+                              {/* Toggle button: switch between summary and raw */}
+                              {lastSummary && (
+                                <button
+                                  onClick={() => setShowSummary(v => !v)}
+                                  className={cn(
+                                    "text-[7px] font-black uppercase tracking-widest px-2 py-0.5 rounded transition-colors border",
+                                    showSummary
+                                      ? "bg-emerald-100 text-emerald-700 border-emerald-300 hover:bg-emerald-200"
+                                      : "bg-gray-100 text-gray-500 border-gray-200 hover:bg-gray-200"
+                                  )}
+                                >
+                                  {showSummary ? "SUMMARY ✓" : "SUMMARY"}
+                                </button>
+                              )}
+                              {/* Clear summary */}
+                              {lastSummary && showSummary && (
+                                <button
+                                  onClick={() => { setLastSummary(null); setShowSummary(false); }}
+                                  className="text-[7px] font-bold text-gray-400 hover:text-rose-500 uppercase tracking-widest transition-colors"
+                                >
+                                  CLEAR ✕
+                                </button>
+                              )}
+                            </div>
+                          </div>
 
-            # รองรับ "m 25" (มีช่องว่าง) → แปลงเป็น "m25"
-            if raw.startswith('m ') and raw[2:].strip().lstrip('-').isdigit():
-                cmd = 'm' + raw[2:].strip()
-            elif raw == 'm':
-                try:
-                    enc_str = input(f"  ระบุพิกัด E1 ({ENCODER_MIN}–{ENCODER_MAX}): ").strip()
-                    if enc_str.lstrip('-').isdigit():
-                        cmd = 'm' + enc_str
-                    else:
-                        print("  ❌ พิกัดไม่ถูกต้อง")
-                        continue
-                except (EOFError, KeyboardInterrupt):
-                    continue
-            else:
-                cmd = raw
+                          {/* Content Box */}
+                          <AnimatePresence mode="wait">
+                            {showSummary && lastSummary ? (
+                              <motion.div
+                                key="summary"
+                                initial={{ opacity: 0, y: 4 }}
+                                animate={{ opacity: 1, y: 0 }}
+                                exit={{ opacity: 0, y: -4 }}
+                                transition={{ duration: 0.2 }}
+                                className="bg-emerald-50 border border-emerald-200 p-4 rounded-sm text-[11px] font-mono text-emerald-800 h-64 overflow-auto leading-relaxed whitespace-pre-wrap"
+                              >
+                                {lastSummary}
+                              </motion.div>
+                            ) : (
+                              <motion.div
+                                key="raw"
+                                initial={{ opacity: 0, y: 4 }}
+                                animate={{ opacity: 1, y: 0 }}
+                                exit={{ opacity: 0, y: -4 }}
+                                transition={{ duration: 0.2 }}
+                                className="bg-gray-100 p-4 rounded-sm text-[11px] font-mono text-gray-500 break-all h-64 overflow-auto leading-relaxed"
+                              >
+                                {lastReceived ? lastReceived : "NO DATA INCOMING..."}
+                              </motion.div>
+                            )}
+                          </AnimatePresence>
+                        </div>
+                  </div>
+               </div>
+            </div>
+          </div>
+        </div>
+          </motion.div>
+        )}
 
-            node.execute_command(cmd)
-            if cmd == 'q':
-                break
-    except KeyboardInterrupt:
-        pass
-    node.yolo_monitor.stop()
-    node.destroy_node()
-    rclpy.shutdown()
+        {/* Footer Meta */}
+        <div className="mt-auto pt-10 flex flex-col md:flex-row justify-between items-center text-[9px] md:text-[10px] font-black uppercase tracking-[0.2em] text-gray-400 gap-4">
+          <div className="flex gap-4">
+            <span>CraneAI | KMUTNB beta 0.01</span>
+            <span className="text-gray-200 hidden md:inline">|</span>
+            <span className="hidden md:inline">SECURE_LINK: {connected ? "ACTIVE" : "PENDING"}</span>
+          </div>
+          <div className="text-black bg-gray-100 px-3 py-1 rounded">
+            {currentTime}
+          </div>
+        </div>
+      </div>
 
-
-if _name_ == '_main_':
-    main()
-10.0.0.2
+      {/* Image Enlarged Overlay */}
+      {selectedImage && (
+        <motion.div 
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          onClick={() => setSelectedImage(null)}
+          className="fixed inset-0 z-[200] bg-black/90 backdrop-blur-md flex items-center justify-center p-4 sm:p-10 cursor-zoom-out"
+        >
+          <motion.div 
+            initial={{ scale: 0.9, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            className="relative max-w-5xl w-full aspect-auto flex items-center justify-center"
+          >
+            <img 
+              src={selectedImage} 
+              alt="Enlarged view" 
+              className="max-w-full max-h-[90vh] object-contain border-[10px] border-white shadow-2xl"
+            />
+            <div className="absolute top-4 right-4 bg-white text-black px-4 py-2 font-black uppercase text-xs tracking-widest shadow-xl">
+              CLICK TO CLOSE
+            </div>
+          </motion.div>
+        </motion.div>
+      )}
+    </div>
+  </div>
+  );
+}
