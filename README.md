@@ -26,9 +26,10 @@ https://github.com/user-attachments/assets/91cf147a-84f3-49de-bd83-a24be2cd6cba
                                          │  (Depth Data)
                                          ▼
                                          
-[ Web Application ] ◄───────► [  Main Processing (Pi/ROS)  ] ───────► [ STM32 Controller ]
+''' [ Web Application ] ◄───────► [  Main Processing (Pi/ROS)  ] ───────► [ STM32 Controller ]'''
 (Flask / Monitoring)         - Object Detection (YOLO)                (Motor & Actuator Control)
 - 3D Height Map Calculation
+  
 1. **Vision & AI Processing (`Main_pi.py`, `Main_ros.py`)**
    * รับข้อมูลภาพและระยะลึก (Depth) จากกล้อง **Intel RealSense D435i**
    * ใช้ **YOLO (Deep Learning)** ในการตรวจจับและจำแนกประเภทกองวัตถุดิบ (หิน/ทราย)
