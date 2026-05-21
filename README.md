@@ -21,9 +21,11 @@ https://github.com/user-attachments/assets/91cf147a-84f3-49de-bd83-a24be2cd6cba
 ## 🛠️ สถาปัตยกรรมระบบ (System Architecture)
 
 ระบบแบ่งการทำงานออกเป็น 3 ส่วนหลัก (ตามโครงสร้างโค้ดใน Repository นี้):
+
                                   [  Intel RealSense D435i  ]
                                          │  (Depth Data)
                                          ▼
+                                         
 [ Web Application ] ◄───────► [  Main Processing (Pi/ROS)  ] ───────► [ STM32 Controller ]
 (Flask / Monitoring)         - Object Detection (YOLO)                (Motor & Actuator Control)
 - 3D Height Map Calculation
