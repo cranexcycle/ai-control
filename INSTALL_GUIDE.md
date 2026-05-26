@@ -53,79 +53,8 @@
 > ⚠️ **หมายเหตุ:** ต้องทำการ Restart Windows 1 ครั้ง หลังเปิดใช้ WSL2 กรุณาบันทึกงานทั้งหมดก่อนเริ่มขั้นตอน
 
 ### ง.2.1 ขั้นตอนที่ 1 — เปิดใช้งาน WSL2 บน Windows
-เปิด PowerShell ในฐานะ Administrator จากนั้นพิมพ์คำสั่งดังนี้:
+เปิด PowerShell ในฐานะ Administrator จากนั้นพิมพ์คำสั่งดังนี้เพื่อเปิดใช้งานและติดตั้งระบบ:
 
 ```bash
-# ขั้นตอนที่ 1.1 — เปิดใช้งาน WSL2
 wsl --install
 wsl --set-default-version 2
-
-# >>> ให้ทำการ Restart Windows แล้วเปิด PowerShell ใหม่ <<<
-
-# ขั้นตอนที่ 1.2 — ติดตั้ง Ubuntu 22.04
-wsl --install -d Ubuntu-22.04
-
-# ขั้นตอนที่ 1.3 — ตรวจสอบผล (ต้องเห็น VERSION = 2)
-wsl --list --verbose
-ง.2.2 ขั้นตอนที่ 2 — ตั้งค่า Ubuntu ครั้งแรกหลังการติดตั้ง Ubuntu ให้รันคำสั่งต่อไปนี้ใน Ubuntu Terminal เพื่ออัปเดตระบบ:Bashsudo apt update && sudo apt upgrade -y
-sudo apt install -y curl gnupg2 lsb-release build-essential git wget
-ง.2.3 ขั้นตอนที่ 3 — ติดตั้ง Python 3.x บน Windows (สำหรับ udp_bridge.py)ดาวน์โหลด Python 3.x จาก python.org/downloadsสำคัญ: ต้องติ๊กเลือกที่ช่อง "Add Python to PATH" ก่อนกด Installตรวจสอบใน Command Prompt (CMD): python --versionง.2.4 ขั้นตอนที่ 4 — ติดตั้ง ROS2 Humble (ใน Ubuntu WSL2)ℹ️ ข้อควรระวัง: ทำใน Ubuntu Terminal เท่านั้น ไม่ใช่ Windows CMDBash# 4.1 ตั้งค่า Locale
-sudo locale-gen en_US en_US.UTF-8
-sudo update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-export LANG=en_US.UTF-8
-
-# 4.2 เพิ่ม ROS2 Repository
-sudo curl -sSL [https://raw.githubusercontent.com/ros/rosdistro/master/ros.key](https://raw.githubusercontent.com/ros/rosdistro/master/ros.key) -o /usr/share/keyrings/ros-archive-keyring.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] [http://packages.ros.org/ros2/ubuntu](http://packages.ros.org/ros2/ubuntu) jammy main" | sudo tee /etc/apt/sources.list.d/ros2.list > /dev/null
-sudo apt update
-
-# 4.3 ติดตั้ง ROS2 Humble Desktop Full
-sudo apt install -y ros-humble-desktop-full
-
-# 4.4 เพิ่ม source ใน .bashrc
-echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc
-source ~/.bashrc
-
-# 4.5 ตรวจสอบ
-ros2 --version
-ง.2.5 ขั้นตอนที่ 5 — ติดตั้ง ROS2 Packages เพิ่มเติมBashsudo apt update && sudo apt install -y \
- ros-humble-ros2-control \
- ros-humble-gazebo-ros2-control \
- ros-humble-joint-trajectory-controller \
- ros-humble-joint-state-broadcaster \
- ros-humble-controller-manager \
- ros-humble-robot-state-publisher \
- ros-humble-joint-state-publisher-gui \
- ros-humble-rviz2 \
- ros-humble-rosbridge-suite \
- ros-humble-xacro \
- liburdfdom-tools
-ง.2.6 ขั้นตอนที่ 6 — ติดตั้ง Python Libraries (Ubuntu WSL2)Bashpip install ultralytics opencv-python numpy scipy flask onnxruntime pyserial
-ง.2.7 ขั้นตอนที่ 7 — สร้าง ROS2 Workspace และคัดลอกระบบควบคุมBashmkdir -p ~/dev_ws/ros2_ws/src
-cd ~/dev_ws/ros2_ws
-colcon build --symlink-install
-source install/setup.bash
-
-echo "source ~/dev_ws/ros2_ws/install/setup.bash" >> ~/.bashrc
-
-# นำโฟลเดอร์แพ็กเกจระบบควบคุมรถเครน (crane_motor) ไปไว้ที่ ~/dev_ws/ros2_ws/src/
-# จากนั้นสั่ง Build ใหม่
-cd ~/dev_ws/ros2_ws
-colcon build --symlink-install
-ง.2.8 ขั้นตอนที่ 8 — ติดตั้ง Node.js สำหรับ Web FrontendBashcurl -fsSL [https://deb.nodesource.com/setup_18.x](https://deb.nodesource.com/setup_18.x) | sudo -E bash -
-sudo apt install -y nodejs
-
-# การรันระบบเว็บอินเตอร์เฟสควบคุม
-cd ~/dev_ws/ai-control
-npm install
-npm run dev
-ง.3 การติดตั้งโปรแกรมบน Raspberry Pi 5ทำบนฮาร์ดแวร์ Raspberry Pi 5 ที่ติดตั้งระบบปฏิบัติการ Ubuntu 22.04 LTS (64-bit) เรียบร้อยแล้วง.3.1 ติดตั้ง ROS2 Humble บน Raspberry Pi 5ให้รันชุดคำสั่งสำหรับติดตั้งตามขั้นตอนเดียวกับข้อ ง.2.4 บน Terminal ของตัว Piง.3.2 ติดตั้ง Python Libraries บน PiBashpip install ultralytics opencv-python numpy scipy pyrealsense2 flask onnxruntime gpiozero pyserial
-ง.3.3 ติดตั้ง Intel RealSense SDK (librealsense2)Bashsudo apt-key adv --keyserver keyserver.ubuntu.com --recv-key F6E65AC044F831AC
-sudo add-apt-repository "deb [https://librealsense.intel.com/Debian/apt-repo](https://librealsense.intel.com/Debian/apt-repo) $(lsb_release -cs) main"
-sudo apt update
-sudo apt install -y librealsense2-dkms librealsense2-utils librealsense2-dev
-ง.3.4 ตั้งค่า Serial Permission สำหรับบอร์ดคอนโทรลเลอร์Bashsudo usermod -aG dialout $USER
-sudo reboot
-# หลังระบบรีบูต ตรวจสอบพอร์ตเชื่อมต่อด้วยคำสั่ง: ls /dev/ttyUSB*
-ง.3.5 วิธีคัดลอกไฟล์โมเดล AI (.onnx) ไปยัง Piรันคำสั่งนี้บน Windows PowerShell หรือ Ubuntu PC เพื่อส่งไฟล์โมเดลไปยังบอร์ดผ่านโปรโตคอล SCP:Bashscp Model_Fix.onnx pi@10.0.0.2:~/dev_ws/
-ง.4 การตั้งค่าเครือข่าย (Network Configuration)การสื่อสารส่งพิกัดและคำสั่งระหว่างสคริปต์ Main_ros.py (PC) และ Main_pi.py (Pi 5) ทำงานผ่านโปรโตคอล UDP จำเป็นต้องฟิกซ์หมายเลข Static IP ดังต่อไปนี้:ตารางที่ ง.2: การจัดสรรหมายเลข IP ภายในระบบอุปกรณ์IP AddressSubnet MaskหมายเหตุPC / Notebook (ROS PC)10.0.0.1255.255.255.0Static IP บนพอร์ต LANRaspberry Pi 510.0.0.2255.255.255.0Static IP บนอินเตอร์เฟส eth0ง.4.1 การแมปพอร์ตและตัวแปรในโค้ดโปรแกรมตรวจสอบพารามิเตอร์ภายในไฟล์สคริปต์ Python เพื่อให้แน่ใจว่าค่าเครือข่ายเชื่อมโยงหากันได้อย่างถูกต้อง:ไฟล์โปรแกรมตัวแปรค่าพารามิเตอร์ความหมายMain_ros.pyPI_IP'10.0.0.2'ชี้เป้าไปที่ IP ของบอร์ด Raspberry PiMain_ros.pyPI_PORT5001พอร์ตส่งข้อมูลคำสั่งไปยัง PiMain_ros.pyLISTEN_PORT5000พอร์ตรอรับสตรีมสถานะกลับจาก PiMain_pi.pyNOTEBOOK_IP'10.0.0.1'ชี้เป้ากลับมาที่ IP ของเครื่องคอมพิวเตอร์หลักง.5 รายการตรวจสอบการติดตั้ง (Verification Checklist)ลำดับทดสอบบนอุปกรณ์คำสั่งในการตรวจสอบผลลัพธ์ที่คาดหวังสถานะ (✓)1PC (WSL2)ros2 --versionros2 distro: humble[ ]2PC (WSL2)python3 -c "import onnxruntime; print('OK')"OK[ ]3PC (Windows CMD)ping 10.0.0.2ปรากฏข้อความ Reply from 10.0.0.2[ ]4Raspberry Pipython3 -c "import pyrealsense2; print('OK')"OK[ ]5Raspberry Pils /dev/ttyUSB*ปรากฏตำแหน่งไฟล์พอร์ต /dev/ttyUSB0[ ]
