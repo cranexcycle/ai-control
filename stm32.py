@@ -17,7 +17,7 @@
 #define MAG1 PB10
 #define MAG2 PB9
 #define VALVE_UP PA5
-#define VALVE_DOWN PB11
+#define VALVE_DOWN PB14
 #define VALVE_BRAKE1 PB13
 #define VALVE_BRAKE2 PB8
 #define DIR_VALVE PA2
