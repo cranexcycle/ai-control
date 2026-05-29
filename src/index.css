@@ -1,0 +1,57 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  
+  @keyframes liquid {
+    0% { transform: translate(0, 0) scale(1); }
+    33% { transform: translate(2%, 1%) scale(1.05); }
+    66% { transform: translate(-1%, 2%) scale(0.95); }
+    100% { transform: translate(0, 0) scale(1); }
+  }
+}
+
+@layer utilities {
+  .liquid-bg {
+    background: #f8fafc;
+    position: relative;
+    isolation: isolate;
+    overflow: hidden;
+  }
+
+  .liquid-bg::before {
+    content: "";
+    position: fixed;
+    inset: -20%;
+    width: 140%;
+    height: 140%;
+    background: 
+      radial-gradient(circle at 20% 30%, rgba(34, 197, 94, 0.08) 0%, transparent 40%),
+      radial-gradient(circle at 80% 70%, rgba(14, 165, 233, 0.08) 0%, transparent 40%),
+      radial-gradient(circle at 50% 50%, rgba(168, 85, 247, 0.05) 0%, transparent 50%);
+    filter: blur(60px);
+    animation: liquid 20s ease-in-out infinite alternate;
+    z-index: -1;
+    pointer-events: none;
+    will-change: transform;
+  }
+
+  .glass {
+    @apply bg-white/60 backdrop-blur-xl border border-white/40 shadow-2xl shadow-black/5;
+  }
+
+  .glass-dark {
+    @apply bg-black/5 backdrop-blur-xl border border-black/5 shadow-2xl shadow-black/5;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 2px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    background: rgba(0, 0, 0, 0.1);
+    border-radius: 10px;
+  }
+}
