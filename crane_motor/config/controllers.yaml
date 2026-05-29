@@ -1,0 +1,31 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 1000  # เพิ่มจาก 100 เป็น 1000 เพื่อความลื่นไหลสูงสุด
+    use_sim_time: true
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    arm_group_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+arm_group_controller:
+  ros__parameters:
+    joints:
+      - headcrane_Link
+      - armcrane_Link
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    # --- ส่วนที่เพิ่มเข้าไปเพื่อความไวในการตอบสนอง ---
+    gains:
+      headcrane_Link:
+        p: 10000.0   # แรงบิดมหาศาลเพื่อให้หมุนตามมือทันที
+        i: 0.1      
+        d: 100.0     # กันสะบัด
+      armcrane_Link:
+        p: 10000.0
+        i: 0.1
+        d: 100.0
