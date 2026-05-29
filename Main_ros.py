@@ -52,8 +52,8 @@ CAMERA_STREAM_URL = "http://10.0.0.2:5002/video_feed"
 YOLO_MODEL_PATH = "yolov8n.pt"
 YOLO_DANGER_CLASSES = {
     0: "person", 1: "bicycle", 2: "car", 3: "motorcycle",
-    5: "bus",  7: "truck", 14: "bird", 15: "cat",
-    16: "dog", 17: "horse",  19: "cow",
+    5: "bus", 7: "truck", 14: "bird", 15: "cat",
+    16: "dog", 17: "horse", 19: "cow",
 }
 YOLO_CONFIDENCE = 0.35
 YOLO_DANGER_TIMEOUT = 120.0
@@ -72,13 +72,21 @@ XCYCLE_CAM_TIMEOUT = 10.0
 XCYCLE_MAX_PASSES = 20
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  HELPER — สร้าง timestamp สำหรับ event log ที่แสดงใน web
+# ─────────────────────────────────────────────────────────────────────────────
+def _now_str():
+    return time.strftime("%I:%M:%S %p")
+
+
 class YoloSafetyMonitor:
     WINDOW_NAME = "🔍 YOLO Safety Monitor — Crane System"
 
-    def __init__(self, stream_url, model_path, logger=None):
+    def __init__(self, stream_url, model_path, logger=None, on_danger_change=None):
         self._url = stream_url
         self._model_path = model_path
         self._logger = logger
+        self._on_danger_change = on_danger_change
         self._model = None
         self._lock = threading.Lock()
         self._danger = False
@@ -90,10 +98,11 @@ class YoloSafetyMonitor:
         self._thread = None
         self._display_thread = None
         self._last_labels: list = []
-        self._grab_lock  = threading.Lock()
+        self._grab_lock = threading.Lock()
         self._grab_event = threading.Event()
-        self._raw_frame  = None
+        self._raw_frame = None
         self._grab_thread = None
+        self._last_reported_danger = None
 
     def _log(self, msg):
         if self._logger:
@@ -165,7 +174,8 @@ class YoloSafetyMonitor:
                         continue
                 ret, frame = cap.read()
                 if not ret:
-                    cap.release(); cap = None
+                    cap.release()
+                    cap = None
                     time.sleep(0.5)
                     continue
                 with self._grab_lock:
@@ -210,6 +220,8 @@ class YoloSafetyMonitor:
                         conf = float(box.conf[0])
                         labels_found.append(f"{label}({conf:.2f})")
                 now = time.time()
+                danger_changed = False
+                new_danger_state = self._danger
                 with self._lock:
                     if detected:
                         if self._detect_since is None:
@@ -218,14 +230,27 @@ class YoloSafetyMonitor:
                         elif (now - self._detect_since) >= self._DEBOUNCE:
                             if not self._danger:
                                 self._danger = True
+                                new_danger_state = True
+                                danger_changed = True
                                 self._log(f"🚨 [YOLO] DANGER ยืนยัน ({self._DEBOUNCE}s): {', '.join(labels_found)}")
                     else:
                         if self._danger:
                             self._log("✅ [YOLO] พื้นที่ปลอดภัยแล้ว")
+                            danger_changed = True
                         self._danger = False
+                        new_danger_state = False
                         self._raw_detected = False
                         self._detect_since = None
                     self._last_labels = labels_found if detected else []
+
+                if danger_changed and self._on_danger_change is not None:
+                    labels_snapshot = list(labels_found) if new_danger_state else []
+                    threading.Thread(
+                        target=self._on_danger_change,
+                        args=(new_danger_state, labels_snapshot),
+                        daemon=True,
+                    ).start()
+
             except Exception as e:
                 self._log(f"❌ [YOLO] loop error: {e}")
                 time.sleep(0.5)
@@ -285,6 +310,7 @@ class CraneIntegratedSystem(Node):
         self.p2 = 0
         self.p3 = 0
         self.p4 = 0
+        self.pressure = 0
         self.e1_position = 0
         self.is_homed = False
         self._sensor_lock = threading.Lock()
@@ -320,28 +346,63 @@ class CraneIntegratedSystem(Node):
         self._press_lost = False
         self._press_lost_lock = threading.Lock()
 
+        # ── event log สำหรับส่งไป web ─────────────────────────────────────
+        # แต่ละ event: {"type": "TAG", "msg": "...", "time": "HH:MM:SS AM/PM"}
+        # type ขึ้นต้น ERR_ / WARN_  → ฝั่งแดง   |  อื่น ๆ → ฝั่งเขียว
+        self._pending_event = None
+        self._event_lock = threading.Lock()
+
         self.yolo_monitor = YoloSafetyMonitor(
             stream_url=CAMERA_STREAM_URL,
             model_path=YOLO_MODEL_PATH,
             logger=self.get_logger(),
+            on_danger_change=self._on_yolo_danger_change,
         )
         self.yolo_monitor.start()
-        threading.Thread(target=self.udp_monitor,       daemon=True).start()
-        threading.Thread(target=self._safety_watchdog,  daemon=True).start()
+        threading.Thread(target=self.udp_monitor,      daemon=True).start()
+        threading.Thread(target=self._safety_watchdog, daemon=True).start()
         self.get_logger().info("🔥 CRANE FAST-TWIN SYSTEM READY (NO MOVEIT - WAITING PI START)")
 
-    # =========================================================
-    # ── NEW HELPER: publish_summary_to_web ──────────────────
-    # =========================================================
-    def publish_summary_to_web(self, summary_text: str):
-        msg = String()
+    # ─────────────────────────────────────────────────────────────────────────
+    #  EVENT HELPER — เรียกจากทุกจุดที่ต้องการส่ง log ไปหน้า web
+    # ─────────────────────────────────────────────────────────────────────────
+    def _push_event(self, event_type: str, msg: str):
+        """
+        บันทึก event ล่าสุดไว้ใน self._pending_event
+        จะถูก attach ไปกับ status JSON ตัวถัดไปที่ publish ออกไป
+        event_type ที่ขึ้นต้นด้วย ERR_ หรือ WARN_ จะแสดงฝั่งแดง
+        อื่น ๆ ทั้งหมด (AT_POS, SCOOP_OK, HOME_OK ฯลฯ) แสดงฝั่งเขียว
+        """
+        with self._event_lock:
+            self._pending_event = {
+                "type": event_type,
+                "msg":  msg,
+                "time": _now_str(),
+            }
+
+    def _pop_event(self):
+        """ดึง pending event ออกมา 1 ตัว (และล้างทิ้ง) เพื่อ attach ใน status"""
+        with self._event_lock:
+            ev = self._pending_event
+            self._pending_event = None
+        return ev
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  BASE STATUS PAYLOAD  (ใช้ร่วมกันทุก publish path)
+    # ─────────────────────────────────────────────────────────────────────────
+    def _build_status_payload(self, event=None):
         with self._press_lost_lock:
             press_lost_now = self._press_lost
         payload = {
-            "summary": summary_text,
-            "p1": self.p1,
-            "p2": self.p2,
-            "p3": self.p3,
+            "p1":               self.p1,
+            "p2":               self.p2,
+            "p3":               self.p3,
+            "p4":               self.p4,
+            "E1":               self.e1_raw or 0,
+            "E2":               self.e2_raw or 0,
+            "LS1":              self.ls1_state,
+            "LS2":              self.ls2_state,
+            "pressure":         self.pressure,
             "is_system_ready":  self.is_system_ready,
             "is_moving":        self.is_moving,
             "cycle_running":    self.cycle_running,
@@ -351,12 +412,91 @@ class CraneIntegratedSystem(Node):
             "pi_emergency":     self._pi_emergency,
             "press_lost":       press_lost_now,
         }
+        # attach event ถ้ามี (ไม่มีก็ไม่ส่ง field นี้ เพื่อไม่รบกวน React)
+        if event:
+            payload["event"] = event
+        else:
+            # ตรวจ pending event ที่ค้างอยู่
+            ev = self._pop_event()
+            if ev:
+                payload["event"] = ev
+        return payload
+
+    def _publish_status(self, event=None):
+        msg = String()
+        msg.data = json.dumps(self._build_status_payload(event=event))
+        self.status_pub.publish(msg)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  publish_summary_to_web  (เรียกตอนจบ cycle — ส่ง CYCLE_END event)
+    # ─────────────────────────────────────────────────────────────────────────
+    def publish_summary_to_web(self, summary_text: str, cycle_label: str = ""):
+        event = {
+            "type": "CYCLE_END",
+            "msg":  summary_text.replace("\n", " | "),
+            "time": _now_str(),
+        }
+        with self._press_lost_lock:
+            press_lost_now = self._press_lost
+        payload = {
+            "summary":          summary_text,
+            "p1":               self.p1,
+            "p2":               self.p2,
+            "p3":               self.p3,
+            "p4":               self.p4,
+            "E1":               self.e1_raw or 0,
+            "E2":               self.e2_raw or 0,
+            "LS1":              self.ls1_state,
+            "LS2":              self.ls2_state,
+            "pressure":         self.pressure,
+            "is_system_ready":  self.is_system_ready,
+            "is_moving":        self.is_moving,
+            "cycle_running":    self.cycle_running,
+            "last_bungkee_pos": float(self.last_bungkee_pos),
+            "current_head_deg": float(self.current_head_deg),
+            "yolo_danger":      self.yolo_monitor.is_danger,
+            "pi_emergency":     self._pi_emergency,
+            "press_lost":       press_lost_now,
+            "event":            event,
+        }
+        msg = String()
         msg.data = json.dumps(payload)
         self.status_pub.publish(msg)
 
-    # =========================================================
-    # reset_state
-    # =========================================================
+    # ─────────────────────────────────────────────────────────────────────────
+    #  YOLO DANGER CHANGE
+    # ─────────────────────────────────────────────────────────────────────────
+    def _on_yolo_danger_change(self, is_danger: bool, labels: list):
+        payload = json.dumps({
+            "YOLO_DANGER": 1 if is_danger else 0,
+            "CLASSES":     labels,
+            "TIME":        time.time(),
+        })
+        try:
+            sock.sendto(payload.encode(), (PI_IP, PI_PORT))
+            status = "DANGER" if is_danger else "CLEAR"
+            self.get_logger().info(
+                f"📡 [YOLO→PI] ส่ง {status} → Pi | classes={labels}")
+        except Exception as e:
+            self.get_logger().warn(f"[YOLO→PI] send error: {e}")
+
+        # ── push event ไปหน้า web ──
+        if is_danger:
+            label_str = ", ".join(labels) if labels else "unknown"
+            self._push_event(
+                "WARN_YOLO",
+                f"YOLO detected obstruction — process paused, watchdog armed ({label_str})"
+            )
+        else:
+            self._push_event(
+                "YOLO_CLEAR",
+                "YOLO area cleared — process resuming after countdown"
+            )
+        self._publish_status()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  RESET STATE
+    # ─────────────────────────────────────────────────────────────────────────
     def reset_state(self):
         self.is_moving = False
         self.system_started = False
@@ -373,9 +513,9 @@ class CraneIntegratedSystem(Node):
         with self._press_lost_lock:
             self._press_lost = False
 
-    # =========================================================
-    # _handle_pi_emergency  (GPIO16)
-    # =========================================================
+    # ─────────────────────────────────────────────────────────────────────────
+    #  PI EMERGENCY / PRESS STOP
+    # ─────────────────────────────────────────────────────────────────────────
     def _handle_pi_emergency(self, state):
         with self._pi_emergency_lock:
             prev = self._pi_emergency
@@ -383,14 +523,16 @@ class CraneIntegratedSystem(Node):
         if state == 1 and not prev:
             self.get_logger().error(
                 "🚨 [PI EMERGENCY] GPIO16 กด Emergency — EMERGENCY SHUTDOWN ทันที!")
+            self._push_event(
+                "ERR_EMERGENCY",
+                "Pi GPIO16 emergency button pressed — all actuators halted immediately"
+            )
+            self._publish_status()
             self.emergency_shutdown()
         elif state == 0 and prev:
             self.get_logger().info(
                 "✅ [PI EMERGENCY] GPIO16 ปล่อยแล้ว — รอ START ใหม่จาก Pi")
 
-    # =========================================================
-    # _handle_press_stop  (GPIO22)
-    # =========================================================
     def _handle_press_stop(self, reason: str = "GPIO22_LOST_WHILE_RUNNING"):
         with self._press_lost_lock:
             already = self._press_lost
@@ -399,14 +541,17 @@ class CraneIntegratedSystem(Node):
             return
         self.get_logger().error(
             f"🛑 [PRESS STOP] Pi รายงาน GPIO22 หลุดขณะทำงาน "
-            f"(reason={reason}) — EMERGENCY SHUTDOWN!"
+            f"(reason={reason}) — EMERGENCY SHUTDOWN!")
+        self._push_event(
+            "ERR_PRESS_LOST",
+            f"GPIO22 pressure sensor lost while running ({reason}) — emergency stop"
         )
-        print(f"\n🛑 [PRESS STOP] GPIO22 lost while running ({reason}) — stopping all systems\n")
+        self._publish_status()
         self.emergency_shutdown()
 
-    # =========================================================
-    # _safety_watchdog
-    # =========================================================
+    # ─────────────────────────────────────────────────────────────────────────
+    #  SAFETY WATCHDOG
+    # ─────────────────────────────────────────────────────────────────────────
     def _safety_watchdog(self):
         while rclpy.ok():
             time.sleep(0.1)
@@ -463,6 +608,11 @@ class CraneIntegratedSystem(Node):
             if elapsed >= YOLO_DANGER_TIMEOUT:
                 self.get_logger().error(
                     f"🛑 [WATCHDOG] ครบ {YOLO_DANGER_TIMEOUT:.0f}s ยังเจอสิ่งกีดขวาง — EMERGENCY STOP!")
+                self._push_event(
+                    "ERR_YOLO_TIMEOUT",
+                    f"Watchdog: obstruction persisted >{YOLO_DANGER_TIMEOUT:.0f}s — emergency stop triggered"
+                )
+                self._publish_status()
                 self.send_udp("DANGER_OFF", bypass_safety=True)
                 self.emergency_shutdown()
 
@@ -478,7 +628,7 @@ class CraneIntegratedSystem(Node):
                     cmd = self.bungkee_cmd
                     if cmd == "UP":
                         self.send_udp("DOWN_OFF", bypass_safety=True)
-                        self.send_udp("UP_ON",   bypass_safety=True)
+                        self.send_udp("UP_ON",    bypass_safety=True)
                     elif cmd == "DOWN":
                         self.send_udp("UP_OFF",   bypass_safety=True)
                         self.send_udp("DOWN_ON",  bypass_safety=True)
@@ -504,15 +654,20 @@ class CraneIntegratedSystem(Node):
                     return True
             time.sleep(0.1)
         self.get_logger().error(f"🛑 [{tag}] หมดเวลารอ — EMERGENCY STOP!")
+        self._push_event(
+            "ERR_YOLO_TIMEOUT",
+            f"Safety check timed out ({label}) — obstruction not cleared, emergency stop"
+        )
+        self._publish_status()
         self.emergency_shutdown()
         return False
 
     def _model_is_off(self):
         return self.yolo_monitor._model is None
 
-    # =========================================================
-    # _rotation_yolo_monitor
-    # =========================================================
+    # ─────────────────────────────────────────────────────────────────────────
+    #  ROTATION YOLO MONITOR  (thread ที่รันขณะ move_to_enc)
+    # ─────────────────────────────────────────────────────────────────────────
     def _rotation_yolo_monitor(self, stop_event, current_mag_cmd_ref):
         mag_stopped = False
         while not stop_event.is_set():
@@ -568,9 +723,9 @@ class CraneIntegratedSystem(Node):
                 self.send_udp("MAG1_OFF", bypass_safety=True)
                 self.send_udp("MAG2_OFF", bypass_safety=True)
 
-    # =========================================================
-    # _bungkee_yolo_brake_monitor
-    # =========================================================
+    # ─────────────────────────────────────────────────────────────────────────
+    #  BUNGKEE YOLO BRAKE MONITOR
+    # ─────────────────────────────────────────────────────────────────────────
     def _bungkee_yolo_brake_monitor(self, phase, stop_event):
         if phase == "DOWN":
             motion_off    = "DOWN_OFF"
@@ -633,9 +788,9 @@ class CraneIntegratedSystem(Node):
             with self._bungkee_yolo_brake_lock:
                 self.send_udp(brake_cmd_off, bypass_safety=True)
 
-    # =========================================================
-    # Helpers
-    # =========================================================
+    # ─────────────────────────────────────────────────────────────────────────
+    #  GAZEBO / ENCODER HELPERS
+    # ─────────────────────────────────────────────────────────────────────────
     def calculate_mapping(self, enc_pos_0_max):
         enc_pos_0_max = max(ENCODER_MIN, min(ENCODER_MAX, enc_pos_0_max))
         ratio = float(enc_pos_0_max - ENCODER_MIN) / (ENCODER_MAX - ENCODER_MIN)
@@ -670,6 +825,9 @@ class CraneIntegratedSystem(Node):
             enc_pos = self.e1_raw - self.e1_offset
             return max(0, min(ENCODER_MAX, enc_pos))
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #  VALVE REPEAT WORKERS
+    # ─────────────────────────────────────────────────────────────────────────
     def _valve_repeat_worker(self, cmd, stop_event):
         deadline = time.time() + VALVE_REPEAT_DURATION
         while not stop_event.is_set() and time.time() < deadline:
@@ -714,6 +872,9 @@ class CraneIntegratedSystem(Node):
         except Exception as e:
             print(f"send_udp error: {e}")
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #  WAIT FOR P4
+    # ─────────────────────────────────────────────────────────────────────────
     def _wait_for_p4(self, timeout=P4_TIMEOUT, label=""):
         self.get_logger().info(f"⏳ [{label}] รอ P4=1 (timeout {timeout}s)...")
         t_start = time.time()
@@ -725,10 +886,18 @@ class CraneIntegratedSystem(Node):
                 return True
             if (time.time() - t_start) > timeout:
                 self.get_logger().error(f"❌ [{label}] P4 TIMEOUT ({timeout}s) — หยุดการทำงาน!")
+                self._push_event(
+                    "ERR_P4_TIMEOUT",
+                    f"P4 sensor timeout after {timeout:.0f}s ({label}) — bungkee UP not confirmed"
+                )
+                self._publish_status()
                 return False
             time.sleep(0.05)
         return False
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #  INITIAL ARM LIFT
+    # ─────────────────────────────────────────────────────────────────────────
     def initial_arm_lift(self):
         self.get_logger().info("⬆️ [ARM LIFT] UP_ON (13s) ...")
         self.send_udp("DOWN_OFF", bypass_safety=True)
@@ -754,6 +923,9 @@ class CraneIntegratedSystem(Node):
             time.sleep(0.05)
         return False
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #  HOMING   ★ ส่ง HOME_OK / ERR_HOME_TIMEOUT
+    # ─────────────────────────────────────────────────────────────────────────
     def do_homing(self, label="HOMING"):
         if not self.system_started:
             self.send_udp("ARM"); time.sleep(0.2); self.send_udp("START")
@@ -802,17 +974,32 @@ class CraneIntegratedSystem(Node):
                 self.is_homed = True
                 self.publish_to_gazebo(self.smooth_pos, sec=0.2)
                 self.get_logger().info(f"✅ [{label}] Homing สำเร็จ! e1_offset={self.e1_offset}")
+                # ── ★ EVENT: HOME_OK ──────────────────────────────────────
+                self._push_event(
+                    "HOME_OK",
+                    f"Homing successful — LS1 triggered, E1 offset={self.e1_offset} ({label})"
+                )
+                self._publish_status()
                 return True
             if (time.time() - start_time) > HOMING_TIMEOUT:
                 self.send_udp("MAG1_OFF")
                 self.send_udp("MAG2_OFF")
                 self.get_logger().error(f"❌ [{label}] Homing Timeout!")
+                # ── ★ EVENT: ERR_HOME_TIMEOUT ────────────────────────────
+                self._push_event(
+                    "ERR_HOME_TIMEOUT",
+                    f"Homing timeout after {HOMING_TIMEOUT:.0f}s — LS1 never triggered ({label})"
+                )
+                self._publish_status()
                 return False
             time.sleep(0.05)
         return False
 
     E2_UP_THRESHOLD = -160
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #  BUNGKEE TASK   ★ ส่ง SCOOP_OK / ERR_P4_TIMEOUT
+    # ─────────────────────────────────────────────────────────────────────────
     def do_bungkee_task(self):
         if not self.yolo_safety_check(label="BUNGKEE-PRE"):
             return False
@@ -880,11 +1067,18 @@ class CraneIntegratedSystem(Node):
         self.send_udp("B1_OFF"); self.send_udp("B2_OFF")
         self.bungkee_cmd = None
         self.get_logger().info("✅ [BUNGKEE] Task เสร็จสิ้น")
+        # ── ★ EVENT: SCOOP_OK ────────────────────────────────────────────
+        e1_now = self.get_e1_position()
+        self._push_event(
+            "SCOOP_OK",
+            f"Bungkee task complete — sand scooped & lifted, P4 UP confirmed (E1={e1_now})"
+        )
+        self._publish_status()
         return True
 
-    # =========================================================
-    # run_cycle  (c1 / c2 / c3)
-    # =========================================================
+    # ─────────────────────────────────────────────────────────────────────────
+    #  RUN CYCLE (single slot)   ★ ส่ง AT_POS, SCAN_OK, CYCLE_END
+    # ─────────────────────────────────────────────────────────────────────────
     def run_cycle(self, slot_number):
         if not self.is_system_ready or self.cycle_running:
             return False
@@ -917,15 +1111,35 @@ class CraneIntegratedSystem(Node):
                     break
                 with self._xcycle_round_lock:
                     cur_round_idx = self._xcycle_capture_round[slot]
+
+                # ── ★ EVENT: SCAN_OK (camera capture ──────────────────────
                 target_e1 = self._xcycle_request_capture(
                     slot=slot, round_idx=cur_round_idx,
                     label=f"CYCLE-S{slot}-P{pass_num}")
                 if target_e1 is None:
                     self._xcycle_advance_round(slot)
                     continue
+                rnd_info = XCYCLE_CAPTURE_ROUNDS[cur_round_idx]
+                self._push_event(
+                    "SCAN_OK",
+                    f"Peak detection complete — slot {slot}, target E1={target_e1} "
+                    f"({rnd_info['label']}, {rnd_info['pct']}%)"
+                )
+                self._publish_status()
+
                 if self._is_slot_full(slot):
                     break
+
+                # ── move to scoop position ────────────────────────────────
                 self.move_to_enc(target_e1, 0.0)
+
+                # ── ★ EVENT: AT_POS ──────────────────────────────────────
+                self._push_event(
+                    "AT_POS",
+                    f"Arm at scoop position — E1={target_e1}, slot {slot} pass {pass_num}"
+                )
+                self._publish_status()
+
                 time.sleep(0.5)
                 if self._is_slot_full(slot):
                     break
@@ -980,6 +1194,12 @@ class CraneIntegratedSystem(Node):
         got = self.cam_target_event.wait(timeout=XCYCLE_CAM_TIMEOUT)
         if got and self.target_e1_from_cam is not None:
             return self.target_e1_from_cam
+        # ── ★ EVENT: ERR_CAM_TIMEOUT ──────────────────────────────────────
+        self._push_event(
+            "ERR_CAM_TIMEOUT",
+            f"Camera capture timeout after {XCYCLE_CAM_TIMEOUT:.0f}s ({label}) — no TARGET_E1 received"
+        )
+        self._publish_status()
         return None
 
     def _xcycle_advance_round(self, slot):
@@ -993,9 +1213,9 @@ class CraneIntegratedSystem(Node):
         with self._xcycle_round_lock:
             self._xcycle_capture_round[slot] = 0
 
-    # =========================================================
-    # run_x_cycle  (AUTO command)
-    # =========================================================
+    # ─────────────────────────────────────────────────────────────────────────
+    #  RUN X CYCLE (auto all slots)   ★ ส่ง AT_POS, SCAN_OK, CYCLE_END
+    # ─────────────────────────────────────────────────────────────────────────
     def run_x_cycle(self):
         if not self.is_system_ready or self.cycle_running:
             return False
@@ -1040,15 +1260,36 @@ class CraneIntegratedSystem(Node):
                         break
                     with self._xcycle_round_lock:
                         cur_round_idx = self._xcycle_capture_round[slot]
+
+                    # ── ★ EVENT: SCAN_OK ──────────────────────────────────
                     target_e1 = self._xcycle_request_capture(
                         slot=slot, round_idx=cur_round_idx,
                         label=f"AUTO-PROCESS-S{slot}-P{current_pass_num}")
                     if target_e1 is None:
                         self._xcycle_advance_round(slot)
                         continue
+                    rnd_info = XCYCLE_CAPTURE_ROUNDS[cur_round_idx]
+                    self._push_event(
+                        "SCAN_OK",
+                        f"Peak detection — slot {slot} target E1={target_e1} "
+                        f"({rnd_info['label']}, {rnd_info['pct']}%)"
+                    )
+                    self._publish_status()
+
                     if self._is_slot_full(slot):
                         break
+
+                    # ── move to scoop position ────────────────────────────
                     self.move_to_enc(target_e1, 0.0)
+
+                    # ── ★ EVENT: AT_POS ──────────────────────────────────
+                    self._push_event(
+                        "AT_POS",
+                        f"Arm at scoop position — E1={target_e1}, "
+                        f"slot {slot} pass {current_pass_num}"
+                    )
+                    self._publish_status()
+
                     time.sleep(0.5)
                     if self._is_slot_full(slot):
                         break
@@ -1064,6 +1305,13 @@ class CraneIntegratedSystem(Node):
                         return False
                     self._xcycle_advance_round(slot)
                     if self._is_slot_full(slot):
+                        # ── ★ EVENT: DELIVER_OK (slot full) ──────────────
+                        self._push_event(
+                            "DELIVER_OK",
+                            f"Slot {slot} full confirmed — P{slot} sensor HIGH, "
+                            f"moving to next slot"
+                        )
+                        self._publish_status()
                         break
                 pass_elapsed = time.time() - slot_pass_start
                 slot_results[slot]["time"] += pass_elapsed
@@ -1073,10 +1321,11 @@ class CraneIntegratedSystem(Node):
                     "scoops": scoops_this_pass,
                     "time":   pass_elapsed,
                 })
+
             self.do_homing(label="AUTO-PROCESS-END-HOME")
-            total_elapsed  = time.time() - total_start
-            total_scoops   = sum(r["scoops"] for r in slot_results.values())
-            total_passes   = sum(r["passes"] for r in slot_results.values())
+            total_elapsed = time.time() - total_start
+            total_scoops  = sum(r["scoops"] for r in slot_results.values())
+            total_passes  = sum(r["passes"] for r in slot_results.values())
 
             sep = "=" * 62
             self.get_logger().info(sep)
@@ -1110,6 +1359,9 @@ class CraneIntegratedSystem(Node):
         finally:
             self.cycle_running = False
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #  MANUAL HOMING / MANUAL MOVE
+    # ─────────────────────────────────────────────────────────────────────────
     def run_homing_manual(self):
         if not self.is_system_ready or self.cycle_running:
             return False
@@ -1133,12 +1385,21 @@ class CraneIntegratedSystem(Node):
                 time.sleep(0.3)
             self._manual_moving = True
             self.move_to_enc(enc_target, 0.0)
+            # ── ★ EVENT: AT_POS (manual) ─────────────────────────────────
+            self._push_event(
+                "AT_POS",
+                f"Manual move complete — arm at E1={enc_target}"
+            )
+            self._publish_status()
             self._manual_moving = False
             return True
         finally:
             self._manual_moving = False
             self._manual_lock.release()
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #  WEB CONTROL CALLBACK
+    # ─────────────────────────────────────────────────────────────────────────
     def web_control_callback(self, msg):
         cmd = msg.data.lower()
         self.get_logger().info(f"📨 [WEB_CMD] Received: {cmd}")
@@ -1164,11 +1425,17 @@ class CraneIntegratedSystem(Node):
             self._manual_homed = False
             self.is_system_ready = True
         elif cmd in ('q', 'stop'):
+            # ── ★ EVENT: ERR_STOP ────────────────────────────────────────
+            self._push_event(
+                "ERR_STOP",
+                f"Manual stop command [{cmd.upper()}] received — all actuators halted"
+            )
+            self._publish_status()
             self.emergency_shutdown()
 
-    # =========================================================
-    # udp_monitor
-    # =========================================================
+    # ─────────────────────────────────────────────────────────────────────────
+    #  UDP MONITOR  (รับข้อมูลจาก Pi)
+    # ─────────────────────────────────────────────────────────────────────────
     def udp_monitor(self):
         while rclpy.ok():
             try:
@@ -1211,6 +1478,20 @@ class CraneIntegratedSystem(Node):
                             f"(ROUND={msg_json.get('ROUND','?')} "
                             f"PCT={msg_json.get('PEAK_PCT','?')}%)")
 
+                    # ── LS1 trigger ──────────────────────────────────────
+                    if msg_json.get("LS1") == 1 and self.ls1_state == 0:
+                        self._push_event(
+                            "ERR_LIMIT_1",
+                            "Limit sensor 1 triggered — rotation stopped for hardware safety"
+                        )
+
+                    # ── LS2 trigger ──────────────────────────────────────
+                    if msg_json.get("LS2") == 1 and self.ls2_state == 0:
+                        self._push_event(
+                            "ERR_LIMIT_2",
+                            "Limit sensor 2 triggered — right-margin brake active"
+                        )
+
                     with self._sensor_lock:
                         if "E1"  in msg_json: self.e1_raw    = int(msg_json["E1"])
                         if "E2"  in msg_json: self.e2_raw    = int(msg_json["E2"])
@@ -1221,25 +1502,24 @@ class CraneIntegratedSystem(Node):
                         self.p3 = int(msg_json.get("P3", self.p3))
                         self.p4 = int(msg_json.get("P4", self.p4))
 
+                    # ── pressure ─────────────────────────────────────────
+                    if "PRESS" in msg_json:
+                        new_press = int(msg_json["PRESS"])
+                        if new_press == 0 and self.pressure != 0 and self.is_system_ready:
+                            self._push_event(
+                                "WARN_PRESSURE",
+                                f"Pressure sensor LOW — hydraulic pressure dropped to 0 bar"
+                            )
+                        self.pressure = new_press
+
                     with self._sensor_lock:
                         e2_val = self.e2_raw
 
-                    status_msg = String()
                     with self._press_lost_lock:
                         press_lost_now = self._press_lost
-                    status_data = {
-                        "p1": self.p1, "p2": self.p2, "p3": self.p3,
-                        "is_system_ready":   self.is_system_ready,
-                        "is_moving":         self.is_moving,
-                        "cycle_running":     self.cycle_running,
-                        "last_bungkee_pos":  float(self.last_bungkee_pos),
-                        "current_head_deg":  float(self.current_head_deg),
-                        "yolo_danger":       self.yolo_monitor.is_danger,
-                        "pi_emergency":      self._pi_emergency,
-                        "press_lost":        press_lost_now,
-                    }
-                    status_msg.data = json.dumps(status_data)
-                    self.status_pub.publish(status_msg)
+
+                    # ── publish full status (with any pending event) ──────
+                    self._publish_status()
 
                     if msg_json.get("START") == 1:
                         with self._pi_emergency_lock:
@@ -1251,6 +1531,11 @@ class CraneIntegratedSystem(Node):
                             self.reset_state()
                             self.is_system_ready = True
                     if msg_json.get("STOP") == 1:
+                        self._push_event(
+                            "ERR_STOP",
+                            "STOP signal received from Pi hardware — all actuators halted"
+                        )
+                        self._publish_status()
                         self.emergency_shutdown()
 
                     if msg_json.get("START_BLOCKED") == 1:
@@ -1261,6 +1546,11 @@ class CraneIntegratedSystem(Node):
                             self.get_logger().warn(
                                 "⚠️  [UDP] GPIO22 (PRESS) ไม่ active — "
                                 "กรุณากดสวิตช์ PRESS ก่อน START")
+                            self._push_event(
+                                "WARN_PRESS_NOT_READY",
+                                "START blocked — GPIO22 pressure sensor not active, press the switch first"
+                            )
+                            self._publish_status()
 
                     if self.is_system_ready and not self.is_moving:
                         l1, l2 = self.ls1_state, self.ls2_state
@@ -1297,6 +1587,9 @@ class CraneIntegratedSystem(Node):
             except Exception as e:
                 print(f"UDP Error: {e}")
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #  EMERGENCY SHUTDOWN   ★ ส่ง ERR_EMERGENCY
+    # ─────────────────────────────────────────────────────────────────────────
     def emergency_shutdown(self):
         self.is_system_ready = False
         self.reset_state()
@@ -1309,6 +1602,9 @@ class CraneIntegratedSystem(Node):
         self._stop_all_valve_repeat()
         self.get_logger().warn("🛑 EMERGENCY STOP")
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #  BRAKE HELPERS
+    # ─────────────────────────────────────────────────────────────────────────
     def trigger_dual_brake_at_bottom(self):
         self.is_braking_now = True
         self.send_udp("B1_ON"); self.send_udp("B2_ON")
@@ -1325,6 +1621,9 @@ class CraneIntegratedSystem(Node):
         self.brake_off_timestamp = time.time()
         self.is_braking_now = False
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #  JOINT CALLBACK (Gazebo feedback → real hardware)
+    # ─────────────────────────────────────────────────────────────────────────
     def joint_callback(self, msg):
         try:
             idx     = msg.name.index('headcrane_Link')
@@ -1364,6 +1663,9 @@ class CraneIntegratedSystem(Node):
         except:
             pass
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #  MOVE (Gazebo command)
+    # ─────────────────────────────────────────────────────────────────────────
     def move(self, head_deg, bungkee=0.0):
         if not self.is_system_ready:
             return
@@ -1381,6 +1683,9 @@ class CraneIntegratedSystem(Node):
     def enc_to_deg(self, enc_pos):
         return math.degrees(self.encoder_to_rad(enc_pos))
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #  MOVE TO ENC   ★ ส่ง AT_POS เมื่อถึงพิกัด
+    # ─────────────────────────────────────────────────────────────────────────
     def move_to_enc(self, enc_target, bungkee=0.0):
         self.move(self.enc_to_deg(enc_target), bungkee)
         current_mag_cmd_ref = [""]
@@ -1392,25 +1697,16 @@ class CraneIntegratedSystem(Node):
         timeout_start = time.time()
         try:
             while rclpy.ok() and self.is_system_ready:
-                # ── บันทึกสถานะก่อนเรียก _wait_if_paused ──────────────
                 was_paused = self._safety_paused
-
                 if not self._wait_if_paused("MOVE_TO_ENC"):
                     break
-
-                # ── เพิ่งกลับมาจาก pause → ให้ _rotation_yolo_monitor
-                #    resume MAG ก่อน แล้ว main loop ค่อยทำงาน
-                #    (ป้องกัน MAG ชนกันทำให้กระตุก) ──────────────────
                 if was_paused and not self._safety_paused:
                     time.sleep(0.4)
-                    # iteration นี้ข้ามการส่ง MAG — monitor thread จัดการแทน
                     time.sleep(0.02)
                     continue
-
                 current_e1 = self.get_e1_position()
                 if abs(enc_target - current_e1) <= 0 or (time.time() - timeout_start) > 12.0:
                     break
-
                 with self._safety_lock:
                     paused_now = self._safety_paused
                 if not paused_now:
@@ -1433,6 +1729,8 @@ class CraneIntegratedSystem(Node):
         self.send_udp("MAG1_OFF")
         self.send_udp("MAG2_OFF")
         self.last_cmd = "STOP"
+        # NOTE: AT_POS event จะถูกส่งจาก run_cycle / run_x_cycle / run_manual
+        #       ซึ่งรู้ context (slot, pass) ดีกว่า ไม่ส่งซ้ำจากที่นี่
 
 
 def main():
