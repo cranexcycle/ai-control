@@ -14,19 +14,119 @@ from flask import Flask, Response
 import onnxruntime as ort
 import os
 
-# ── CONFIGURATION ──────────────────────────────────────────
+
+# â”€â”€ CONFIGURATION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 NOTEBOOK_IP   = "10.0.0.1"
 NOTEBOOK_PORT = 5000
 PI_PORT       = 5001
+
+# â”€â”€ PER-STATION HEIGHT CALIBRATION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# à¸à¸¥à¹‰à¸­à¸‡à¹€à¸­à¸µà¸¢à¸‡ 45Â° à¸¡à¸­à¸‡Â­à¸¥à¸‡  deproject pixel â†’ 3D camera frame
+# vertical_mm = Z*sin(45Â°) - Y*cos(45Â°)   (à¹à¸™à¸§à¸”à¸´à¹ˆà¸‡à¹ƒà¸™à¹‚à¸¥à¸à¸ˆà¸£à¸´à¸‡)
+# height_cm   = COEFF_B[st] - COEFF_A[st] * vertical_mm
+#
+# Station 1  calibrated à¸ˆà¸²à¸:
+#   P1 xy=(494,276) dist=592 mm â†’ height = 18.19 cm  (à¹ƒà¸Šà¹‰à¸„à¹ˆà¸²à¹€à¸”à¸´à¸¡à¸ˆà¸²à¸à¸Šà¹ˆà¸­à¸‡ 2 à¹€à¸›à¹‡à¸™ seed à¹à¸¥à¹‰à¸§ fit à¹ƒà¸«à¸¡à¹ˆ)
+#   P2 xy=(535,221) dist=606 mm â†’ height = 17.46 cm
+#   P3 xy=(311,262) dist=645 mm â†’ height = 12.50 cm
+#
+# Station 2  calibrated à¸ˆà¸²à¸ data à¸ˆà¸£à¸´à¸‡ (à¹€à¸ªà¸£à¹‡à¸ˆà¹à¸¥à¹‰à¸§ â€” à¹ƒà¸Šà¹‰à¸„à¹ˆà¸²à¹€à¸”à¸´à¸¡):
+#   P1(289,377,649) â†’ 18.19, P2(362,376,660) â†’ 17.46, P3(535,326,668) â†’ 11.50
+#
+# Station 3  à¸¢à¸±à¸‡à¹ƒà¸Šà¹‰à¸„à¹ˆà¸²à¹€à¸”à¸µà¸¢à¸§à¸à¸±à¸š station 2 (à¸£à¸­ calibration à¸ˆà¸£à¸´à¸‡)
+#
+# â”€â”€ PER-STATION HEIGHT MODEL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Model: height_cm = C0 + C1*dist_mm + C2*py
+# fit à¸ˆà¸²à¸ 3 à¸ˆà¸¸à¸” calibration à¸•à¹ˆà¸­ station (3 equations, 3 unknowns â†’ exact fit)
+#
+# à¸§à¸´à¸˜à¸µà¹€à¸žà¸´à¹ˆà¸¡/à¹à¸à¹‰ calibration:
+#   à¹à¸à¹‰ CALIB_PTS[station] à¹ƒà¸«à¹‰à¸•à¸£à¸‡à¸à¸±à¸šà¸ˆà¸¸à¸”à¸—à¸µà¹ˆà¸§à¸±à¸”à¸ˆà¸£à¸´à¸‡ (px, py, dist_mm, height_cm)
+#   à¹à¸¥à¹‰à¸§à¸£à¸±à¸™à¹‚à¸›à¸£à¹à¸à¸£à¸¡à¹ƒà¸«à¸¡à¹ˆ â€” coefficients à¸ˆà¸°à¸–à¸¹à¸ fit à¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´
+#
+# Station 1: à¸§à¸±à¸”à¸ˆà¸²à¸à¸ à¸²à¸ž log
+#   #1 xy=(494,272) dist=590 â†’ 18.0 cm
+#   #2 xy=(538,220) dist=608 â†’ 17.5 cm
+#   #3 xy=(319,257) dist=649 â†’ 12.0 cm
+#
+# Station 2: calibrated à¸ˆà¸²à¸à¸‚à¹‰à¸­à¸¡à¸¹à¸¥à¸ˆà¸£à¸´à¸‡ (à¹€à¸ªà¸£à¹‡à¸ˆà¹à¸¥à¹‰à¸§)
+#   P1(289,377,649) â†’ 18.19 cm
+#   P2(362,376,660) â†’ 17.46 cm
+#   P3(535,326,668) â†’ 11.50 cm
+#
+# Station 3: placeholder à¹ƒà¸Šà¹‰à¸„à¹ˆà¸²à¸Šà¹ˆà¸­à¸‡ 2 à¹„à¸›à¸à¹ˆà¸­à¸™ (à¸£à¸­ calibration à¸ˆà¸£à¸´à¸‡)
+
+CALIB_PTS = {
+    '1': [
+        (484, 343, 601.0, 18.0),    # #1 à¸ˆà¸²à¸ log à¸ˆà¸£à¸´à¸‡
+        (485, 269, 624.0, 13.0),    # #2 à¸ˆà¸²à¸ log à¸ˆà¸£à¸´à¸‡
+        (418, 305, 649.0, 12.0),    # #3 à¸ˆà¸²à¸ log à¸ˆà¸£à¸´à¸‡
+    ],
+    '2': [
+        (289, 377, 649.0, 18.19),
+        (362, 376, 660.0, 17.46),
+        (535, 326, 668.0, 11.50),
+    ],
+    '3': [
+        (442, 366, 667.0, 18.0),    # #1 à¸ˆà¸²à¸ log à¸ˆà¸£à¸´à¸‡
+        (305, 294, 675.0, 13.5),    # #2 à¸ˆà¸²à¸ log à¸ˆà¸£à¸´à¸‡
+        (366, 258, 688.0, 12.5),    # #3 à¸ˆà¸²à¸ log à¸ˆà¸£à¸´à¸‡
+    ],
+}
+
+# STATION_COEFFS[st] = (C0, C1, C2)  à¸ªà¸³à¸«à¸£à¸±à¸š  h = C0 + C1*dist + C2*py
+STATION_COEFFS = {}
+
+def _fit_station_coeffs(calib_points):
+    """
+    fit: height_cm = C0 + C1*dist_mm + C2*py
+    calib_points: list of (px, py, dist_mm, height_cm)
+    à¸„à¸·à¸™ (C0, C1, C2)
+    """
+    A = np.array([[1.0, d, float(py)] for _, py, d, _ in calib_points], dtype=np.float64)
+    b = np.array([h for *_, h in calib_points],                         dtype=np.float64)
+    coeffs, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    return tuple(float(c) for c in coeffs)   # (C0, C1, C2)
+
+def _init_all_station_coeffs():
+    """fit à¸—à¸¸à¸ station à¹à¸¥à¸° print à¸œà¸¥à¸•à¸£à¸§à¸ˆà¸ªà¸­à¸š"""
+    for st, pts in CALIB_PTS.items():
+        c0, c1, c2 = _fit_station_coeffs(pts)
+        STATION_COEFFS[st] = (c0, c1, c2)
+        print(f"[CALIB] ST:{st}  C0={c0:.4f}  C1={c1:.6f}  C2={c2:.6f}")
+        for i, (px, py, dist_mm, true_h) in enumerate(pts):
+            pred = c0 + c1 * dist_mm + c2 * py
+            print(f"  [CHECK] ST:{st} #{i+1} px=({px},{py}) dist={dist_mm:.0f}  "
+                  f"pred={pred:.2f}cm  true={true_h:.2f}cm  err={pred-true_h:+.2f}cm")
+
+# fit à¸—à¸±à¸™à¸—à¸µà¸•à¸­à¸™ import (à¹„à¸¡à¹ˆà¸•à¹‰à¸­à¸‡à¸£à¸­ intrinsics)
+_init_all_station_coeffs()
+
+# â”€â”€ à¸Ÿà¸±à¸‡à¸à¹Œà¸Šà¸±à¸™à¹à¸›à¸¥à¸‡ pixel+dist â†’ height_cm â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+def pixel_dist_to_height_cm(px: int, py: int, dist_mm: float, intrinsics, station: str = '2') -> float:
+    """à¹à¸›à¸¥à¸‡ (pixel_x, pixel_y, depth_mm) â†’ à¸„à¸§à¸²à¸¡à¸ªà¸¹à¸‡à¹€à¸™à¸´à¸™ (cm) à¸”à¹‰à¸§à¸¢ per-station model"""
+    if dist_mm <= 0:
+        return 0.0
+    st = str(station)
+    c0, c1, c2 = STATION_COEFFS.get(st, STATION_COEFFS.get('2', (89.0, -0.109, -0.028)))
+    return c0 + c1 * dist_mm + c2 * float(py)
+
+def dist_to_height_cm(dist_mm: float, station: str = '2') -> float:
+    """fallback à¹€à¸¡à¸·à¹ˆà¸­à¹„à¸¡à¹ˆà¸¡à¸µ pixel y â€” à¹ƒà¸Šà¹‰ py à¹€à¸‰à¸¥à¸µà¹ˆà¸¢à¸‚à¸­à¸‡ ROI à¹à¸—à¸™"""
+    _roi_center_py = {'1': 300, '2': 370, '3': 300}
+    py_est = _roi_center_py.get(str(station), 320)
+    return pixel_dist_to_height_cm(320, py_est, dist_mm, None, station)
+
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 sock.bind(("0.0.0.0", PI_PORT))
 
+
 SERIAL_PORT  = '/dev/ttyUSB0'
 SERIAL_BAUD  = 115200
 ser          = None
 ser_lock     = threading.Lock()
+
 
 def _open_serial():
     global ser
@@ -38,11 +138,11 @@ def _open_serial():
             print(f"[SERIAL] Connected: {SERIAL_PORT}")
             return
         except Exception as e:
-            print(f"[SERIAL] Open failed: {e} — retry in 3s")
+            print(f"[SERIAL] Open failed: {e} â€“ retry in 3s")
             time.sleep(3)
 
+
 def safe_serial_write(data: bytes):
-    """Write to serial; reconnect silently on failure."""
     with ser_lock:
         s = ser
     if s is None:
@@ -50,8 +150,9 @@ def safe_serial_write(data: bytes):
     try:
         s.write(data)
     except Exception as e:
-        print(f"[SERIAL] Write error: {e} — reconnecting")
+        print(f"[SERIAL] Write error: {e} â€“ reconnecting")
         threading.Thread(target=_open_serial, daemon=True).start()
+
 
 def safe_udp_send(payload: str, dest=(NOTEBOOK_IP, NOTEBOOK_PORT)):
     try:
@@ -59,23 +160,27 @@ def safe_udp_send(payload: str, dest=(NOTEBOOK_IP, NOTEBOOK_PORT)):
     except Exception as e:
         print(f"[UDP] Send error: {e}")
 
-# ── HARDWARE SETUP ──────────────────────────────────────────
+
+# â”€â”€ HARDWARE SETUP â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 btn_start  = InputDevice(17, pull_up=True)
 btn_stop   = InputDevice(27, pull_up=True)
 press_sens = InputDevice(22, pull_up=True)
-emerg_sens = InputDevice(16, pull_up=True)   # active LOW = safe
+emerg_sens = InputDevice(16, pull_up=True)
 lamp_green = OutputDevice(23, active_high=False, initial_value=False)
 lamp_red   = OutputDevice(24, active_high=False, initial_value=True)
 lamp_blue  = OutputDevice(25, active_high=False, initial_value=False)
+
 
 is_running           = 0
 current_station      = '1'
 auto_capture_trigger = False
 
-# ── EMERGENCY STATE ─────────────────────────────────────────
+
+# â”€â”€ EMERGENCY STATE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 emergency_active      = False
 emergency_lock        = threading.Lock()
 _blink_thread_started = False
+
 
 last_state = {
     "START": 0,
@@ -90,7 +195,7 @@ stm32_status_lock = threading.Lock()
 last_captured_frame = None
 stream_lock         = threading.Lock()
 
-# ── X-CYCLE CAPTURE STATE ───────────────────────────────────
+# â”€â”€ X-CYCLE CAPTURE STATE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 xcap_lock          = threading.Lock()
 xcap_pending       = None
 xcap_trigger_event = threading.Event()
@@ -108,7 +213,15 @@ capture_round_lock       = threading.Lock()
 multi_peaks_cache = []
 multi_peaks_lock  = threading.Lock()
 
-# ── YOLO ────────────────────────────────────────────────────
+# â”€â”€ YOLO DANGER DISPLAY STATE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+yolo_danger_display = {
+    "active":  False,
+    "classes": [],
+    "since":   0.0,
+}
+yolo_danger_lock = threading.Lock()
+
+# â”€â”€ YOLO â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 YOLO_CLASS_NAMES = {
     0:"person",1:"bicycle",2:"car",3:"motorcycle",4:"airplane",
     5:"bus",6:"train",7:"truck",8:"boat",9:"traffic light",
@@ -134,7 +247,8 @@ YOLO_DELAY_SEC   = 1.1
 YOLO_VOTE_ROUNDS = 3
 YOLO_VOTE_CONF   = 0.5
 
-# ── EMERGENCY MONITOR & BLINK ───────────────────────────────
+
+# â”€â”€ EMERGENCY MONITOR & BLINK â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def _red_blink_loop():
     while True:
         with emergency_lock:
@@ -146,6 +260,7 @@ def _red_blink_loop():
         else:
             time.sleep(0.05)
 
+
 def emergency_monitor():
     global emergency_active, is_running
     prev_emerg = None
@@ -154,14 +269,14 @@ def emergency_monitor():
             current_emerg = not emerg_sens.is_active
             if current_emerg != prev_emerg:
                 if current_emerg:
-                    print("[EMERGENCY] GPIO16 signal lost — Emergency activated.")
+                    print("[EMERGENCY] GPIO16 signal lost â€“ Emergency activated.")
                     with emergency_lock:
                         emergency_active = True
                     if is_running:
                         reset_all_systems(from_emergency=True)
                     lamp_green.off(); lamp_red.off()
                 else:
-                    print("[EMERGENCY] GPIO16 restored — System ready.")
+                    print("[EMERGENCY] GPIO16 restored â€“ System ready.")
                     with emergency_lock:
                         emergency_active = False
                     lamp_red.on(); lamp_green.off()
@@ -171,7 +286,8 @@ def emergency_monitor():
             print(f"[emergency_monitor] {e}")
             time.sleep(0.1)
 
-# ── GPIO22 PRESS SENSOR MONITOR ─────────────────────────────
+
+# â”€â”€ GPIO22 PRESS SENSOR MONITOR â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def press_sensor_monitor():
     global is_running
     prev_press = None
@@ -193,7 +309,8 @@ def press_sensor_monitor():
             print(f"[press_sensor_monitor] {e}")
             time.sleep(0.1)
 
-# ── BRIDGE HELPERS ───────────────────────────────────────────
+
+# â”€â”€ BRIDGE HELPERS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def reset_all_systems(from_emergency=False):
     global is_running
     print("!!! STOP: RESETTING ALL SYSTEMS !!!")
@@ -205,6 +322,7 @@ def reset_all_systems(from_emergency=False):
     if not from_emergency:
         for cmd in [b"STOP\n", b"DISARM\n", b"MAG1_OFF\n", b"MAG2_OFF\n"]:
             safe_serial_write(cmd)
+
 
 def send_full_status():
     try:
@@ -225,7 +343,8 @@ def send_full_status():
     except Exception as e:
         print(f"[send_full_status] {e}")
 
-# ── X-CYCLE CAPTURE HANDLER ──────────────────────────────────
+
+# â”€â”€ X-CYCLE CAPTURE HANDLER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def handle_xcap_command(xcap_data: dict):
     global current_station
     slot      = int(xcap_data.get("SLOT", 1))
@@ -238,7 +357,8 @@ def handle_xcap_command(xcap_data: dict):
         xcap_pending = {"slot": slot, "round_num": round_num, "pct": pct}
     xcap_trigger_event.set()
 
-# ── RECV CMD ─────────────────────────────────────────────────
+
+# â”€â”€ RECV CMD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def recv_cmd():
     global is_running, current_station, auto_capture_trigger
     while True:
@@ -253,10 +373,25 @@ def recv_cmd():
                         msg_json = json.loads(cmd_str)
                     except json.JSONDecodeError:
                         msg_json = {}
+
+                    if "YOLO_DANGER" in msg_json:
+                        with yolo_danger_lock:
+                            if msg_json["YOLO_DANGER"] == 1:
+                                yolo_danger_display["active"]  = True
+                                yolo_danger_display["classes"] = msg_json.get("CLASSES", [])
+                                yolo_danger_display["since"]   = time.time()
+                                print(f"[PI DISPLAY] YOLO DANGER: {yolo_danger_display['classes']}")
+                            else:
+                                yolo_danger_display["active"]  = False
+                                yolo_danger_display["classes"] = []
+                                print("[PI DISPLAY] YOLO CLEAR")
+                        continue
+
                     if msg_json.get("XCAP") == 1:
                         threading.Thread(target=handle_xcap_command,
                                          args=(msg_json,), daemon=True).start()
                     continue
+
                 cmd = cmd_str
                 if cmd in ["1","2","3"]:
                     current_station      = cmd
@@ -293,12 +428,14 @@ def recv_cmd():
         except Exception as e:
             print(f"[recv_cmd] {e}")
 
+
 def _delayed_full_status_resend():
     time.sleep(0.3)
     for _ in range(3):
         send_full_status(); time.sleep(0.2)
 
-# ── STM32 SERIAL READ ────────────────────────────────────────
+
+# â”€â”€ STM32 SERIAL READ â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def _parse_stm32_line(line):
     try:
         clean  = line.replace("DBG","").replace("|"," ")
@@ -318,6 +455,7 @@ def _parse_stm32_line(line):
     except Exception:
         pass
 
+
 def read_ser():
     while True:
         try:
@@ -331,16 +469,18 @@ def read_ser():
                 _parse_stm32_line(line)
                 safe_udp_send(line)
         except serial.SerialException as e:
-            print(f"[read_ser] SerialException: {e} — reconnecting")
+            print(f"[read_ser] SerialException: {e} â€“ reconnecting")
             threading.Thread(target=_open_serial, daemon=True).start()
             time.sleep(3)
         except Exception as e:
             print(f"[read_ser] {e}")
             time.sleep(0.1)
 
-# ── GPIO MONITOR ─────────────────────────────────────────────
+
+# â”€â”€ GPIO MONITOR â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _start_btn_debounce = 0.0
 _START_DEBOUNCE_SEC = 0.5
+
 
 def gpio_monitor():
     global is_running, _start_btn_debounce
@@ -356,9 +496,9 @@ def gpio_monitor():
             if curr_btn_start == 1 and is_running == 0 and (now - _start_btn_debounce) > _START_DEBOUNCE_SEC:
                 _start_btn_debounce = now
                 if emerg:
-                    print("[GPIO] START blocked — EMERGENCY active")
+                    print("[GPIO] START blocked â€“ EMERGENCY active")
                 elif not press_sens.is_active:
-                    print("[GPIO] START blocked — GPIO22 (PRESS) not active")
+                    print("[GPIO] START blocked â€“ GPIO22 (PRESS) not active")
                 else:
                     is_running = 1
                     safe_serial_write(b"START\n")
@@ -388,7 +528,8 @@ def gpio_monitor():
             print(f"[gpio_monitor] {e}")
             time.sleep(0.1)
 
-# ── VISION SYSTEM SETUP ──────────────────────────────────────
+
+# â”€â”€ VISION SYSTEM SETUP â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 print("Initializing Vision System...")
 yolo_guard = YOLO('yolov8n.pt')
 
@@ -405,7 +546,7 @@ rois = {
     '2': np.array([[(73,319),(636,262),(558,427),(196,459)]], dtype=np.int32),
     '3': np.array([[(186,203),(542,174),(500,425),(260,433)]], dtype=np.int32),
 }
-E1_OUTPUT_CLAMP = {'1':(0,13), '2':(22,46), '3':(46,61)}
+E1_OUTPUT_CLAMP = {'1':(0,12), '2':(24,38), '3':(48,61)}
 e1_ranges       = {'1':(-4,19),'2':(13,50), '3':(46,61)}
 CAMERA_ANGLE_DEG = 45.0
 PILE_HEIGHT_MM   = 180.0
@@ -426,11 +567,12 @@ spatial.set_option(rs.option.filter_magnitude,    3)
 spatial.set_option(rs.option.filter_smooth_alpha, 0.55)
 spatial.set_option(rs.option.filter_smooth_delta, 20)
 
-# ── ANALYSIS FUNCTIONS ───────────────────────────────────────
+
+# â”€â”€ ANALYSIS FUNCTIONS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class SharedState:
     def __init__(self):
         self.lock                = threading.Lock()
-        self.analysis_ready      = threading.Event()   # fires when done
+        self.analysis_ready      = threading.Event()
         self.peak_xy             = None
         self.ai_xy               = None
         self.e1_val              = 0
@@ -452,7 +594,9 @@ class SharedState:
         self.xcap_meta           = None
         self.snap_round          = 0
 
+
 state = SharedState()
+
 
 def compute_bump_map(depth_f32, mask_safe):
     valid = (depth_f32 > 0) & (mask_safe > 0)
@@ -473,6 +617,7 @@ def compute_bump_map(depth_f32, mask_safe):
         bump = bump * (PILE_HEIGHT_MM / peak_v); bump[~valid] = 0.0
     return bump, (a, b, c)
 
+
 def compute_specular_map(bgr, mask_safe):
     lab   = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
     L     = lab[:,:,0].astype(np.float32)
@@ -480,6 +625,7 @@ def compute_specular_map(bgr, mask_safe):
     spec  = np.clip(L - local, 0, None); spec[mask_safe==0] = 0
     spec  = cv2.GaussianBlur(spec, (31,31), 0)
     return cv2.normalize(spec, None, 0, 255, cv2.NORM_MINMAX).astype(np.float32)
+
 
 def compute_diffuse_gradient_map(bgr, mask_safe):
     gray  = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
@@ -490,6 +636,7 @@ def compute_diffuse_gradient_map(bgr, mask_safe):
     rg    = cv2.magnitude(rx, ry)
     dm    = np.clip(cv2.GaussianBlur(ig,(51,51),0) - rg*0.3, 0, None); dm[mask_safe==0] = 0
     return cv2.normalize(dm, None, 0, 255, cv2.NORM_MINMAX).astype(np.float32)
+
 
 def compute_light_refraction_map(bgr, depth_f32, mask_safe):
     dz_dx = cv2.Sobel(depth_f32, cv2.CV_32F,1,0,ksize=7)
@@ -503,6 +650,7 @@ def compute_light_refraction_map(bgr, depth_f32, mask_safe):
     res   = np.clip(act_s - exp_s*0.7, 0, None); res[mask_safe==0] = 0
     res   = cv2.GaussianBlur(res, (41,41), 0)
     return cv2.normalize(res, None, 0, 255, cv2.NORM_MINMAX).astype(np.float32)
+
 
 def build_depth_prominence_map(depth_f32, mask_safe):
     invalid = (depth_f32==0)|(mask_safe==0)
@@ -519,7 +667,9 @@ def build_depth_prominence_map(depth_f32, mask_safe):
     c  = tophat(s,60)*0.20 + tophat(m,100)*0.35 + tophat(lg,140)*0.45; c[mask_safe==0] = 0
     return cv2.normalize(c, None, 0, 255, cv2.NORM_MINMAX).astype(np.float32)
 
+
 MIN_PEAK_DISTANCE = 60
+
 
 def find_multi_peaks(score_map, depth_f32, mask_safe, num_peaks=3, min_dist=MIN_PEAK_DISTANCE):
     blurred = cv2.GaussianBlur(score_map,(51,51),0); blurred[mask_safe==0] = 0
@@ -541,6 +691,7 @@ def find_multi_peaks(score_map, depth_f32, mask_safe, num_peaks=3, min_dist=MIN_
         cv2.circle(work_map,(cx,cy),min_dist,0,-1)
     return peaks
 
+
 def e1_from_xy(tx, active_roi, st_key):
     pts_x        = active_roi[0,:,0]
     x_min,x_max  = np.min(pts_x), np.max(pts_x)
@@ -548,6 +699,7 @@ def e1_from_xy(tx, active_roi, st_key):
     raw           = e1_min + (tx-x_min)*(e1_max-e1_min)/(x_max-x_min)
     lo, hi        = E1_OUTPUT_CLAMP[st_key]
     return int(np.clip(raw, lo, hi))
+
 
 def full_analysis(snap_img, snap_depth, active_roi, st_key):
     mask      = np.zeros((480,640), dtype=np.uint8)
@@ -566,12 +718,26 @@ def full_analysis(snap_img, snap_depth, active_roi, st_key):
     final_map = cv2.GaussianBlur(fusion,(51,51),0); final_map[mask_safe==0] = 0
     raw_peaks = find_multi_peaks(final_map, snap_depth, mask_safe, num_peaks=3)
     top_score = raw_peaks[0][0] if raw_peaks else 1.0
+
+    bump_map, _ = compute_bump_map(snap_depth, mask_safe)
+
     multi_peaks = []
     for score,(px,py) in raw_peaks:
-        pct  = score/top_score if top_score > 1e-6 else 0.0
-        e1v  = e1_from_xy(px, active_roi, st_key)
-        multi_peaks.append({"xy":(px,py),"score":score,"pct":pct,"e1":e1v,"dist":float(snap_depth[py,px])})
-    primary = multi_peaks[0] if multi_peaks else {"xy":(320,240),"pct":1.0,"e1":0,"dist":0.0}
+        pct      = score/top_score if top_score > 1e-6 else 0.0
+        e1v      = e1_from_xy(px, active_roi, st_key)
+        dist     = float(snap_depth[py, px])
+        # â”€â”€ à¸„à¸³à¸™à¸§à¸“à¸„à¸§à¸²à¸¡à¸ªà¸¹à¸‡à¹€à¸™à¸´à¸™ (cm) à¸”à¹‰à¸§à¸¢ per-station calibration â”€â”€
+        height_cm = pixel_dist_to_height_cm(px, py, dist, intr, station=st_key)
+        multi_peaks.append({
+            "xy":        (px, py),
+            "score":     score,
+            "pct":       pct,
+            "e1":        e1v,
+            "dist":      dist,
+            "height_cm": height_cm,
+        })
+
+    primary = multi_peaks[0] if multi_peaks else {"xy":(320,240),"pct":1.0,"e1":0,"dist":0.0,"height_cm":0.0}
     tx, ty  = primary["xy"]
     img_in  = cv2.resize(cv2.cvtColor(snap_img,cv2.COLOR_BGR2RGB),(224,224)).astype(np.float32)
     img_in  = np.expand_dims(np.transpose(img_in,(2,0,1)),0)
@@ -587,15 +753,36 @@ def full_analysis(snap_img, snap_depth, active_roi, st_key):
     c3 = lbl(cv2.applyColorMap(norm8(diffuse),    cv2.COLORMAP_OCEAN),  "Diffuse")
     c4 = lbl(cv2.applyColorMap(norm8(refract),    cv2.COLORMAP_PLASMA), "Refraction")
     debug_grid = cv2.resize(np.vstack([np.hstack([c1,c2]),np.hstack([c3,c4])]),(640,480))
-    bump_map, _ = compute_bump_map(snap_depth, mask_safe)
     return dict(
-        peak_xy=( tx,ty), ai_xy=(ai_tx,ai_ty),
+        peak_xy=(tx,ty), ai_xy=(ai_tx,ai_ty),
         e1_val=primary["e1"], dist_mm=primary["dist"],
         heat_overlay=heat_masked, debug_grid=debug_grid,
         bump_map=bump_map, multi_peaks=multi_peaks, mask_safe=mask_safe,
     )
 
+
+# â”€â”€ PRINT ALL 3 PEAKS HELPER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+def print_all_peaks(multi_peaks: list, station: str, label: str = ""):
+    tag = f"[PEAKS]{' '+label if label else ''} ST:{station}"
+    if not multi_peaks:
+        print(f"{tag}  (no peaks found)")
+        return
+    lines = [f"{tag}  ({len(multi_peaks)} peaks)"]
+    for i, pk in enumerate(multi_peaks):
+        px, py    = pk["xy"]
+        pct_pct   = int(round(pk["pct"] * 100))
+        e1v       = pk["e1"]
+        dist      = pk["dist"]
+        height_cm = pk.get("height_cm", 0.0)
+        lines.append(
+            f"  #{i+1}  xy=({px:3d},{py:3d})  pct={pct_pct:3d}%  E1={e1v:3d}"
+            f"  dist={dist:.1f}mm  height={height_cm:.2f}cm"
+        )
+    print("\n".join(lines))
+
+
 stop_event = threading.Event()
+
 
 def analysis_worker():
     while not stop_event.is_set():
@@ -637,19 +824,22 @@ def analysis_worker():
             with multi_peaks_lock:
                 global multi_peaks_cache
                 multi_peaks_cache = res['multi_peaks']
+            print_all_peaks(res['multi_peaks'], st, label="(live)")
         except Exception as e:
             print(f"[analysis_worker] {e}")
             with state.lock:
                 state.processing = False
             time.sleep(0.1)
 
-# ── RESULT SENDER ────────────────────────────────────────────
+
+# â”€â”€ RESULT SENDER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def _pick_peak_by_pct(multi_peaks: list, target_pct_float: float) -> dict:
     if not multi_peaks:
-        return {"xy":(320,240),"pct":1.0,"e1":0,"dist":0.0}
+        return {"xy":(320,240),"pct":1.0,"e1":0,"dist":0.0,"height_cm":0.0}
     if target_pct_float >= 1.0:
         return multi_peaks[0]
     return min(multi_peaks, key=lambda p: abs(p["pct"] - target_pct_float))
+
 
 def send_result_for_xcap(multi_peaks: list, xcap_meta: dict):
     slot      = xcap_meta.get("slot", 1)
@@ -658,33 +848,45 @@ def send_result_for_xcap(multi_peaks: list, xcap_meta: dict):
     if not multi_peaks:
         safe_udp_send(json.dumps({"TARGET_E1":-1,"STATION":slot,"ROUND":round_num,"PEAK_PCT":0.0}))
         return
-    chosen  = _pick_peak_by_pct(multi_peaks, pct/100.0)
+    print_all_peaks(multi_peaks, str(slot), label=f"XCAP round={round_num} req={pct}%")
+    chosen    = _pick_peak_by_pct(multi_peaks, pct/100.0)
+    height_cm = chosen.get("height_cm", 0.0)
+    print(f"[XCAP RESULT] slot={slot} round={round_num} pct_req={pct}%"
+          f" -> CHOSEN xy={chosen['xy']} pct={int(chosen['pct']*100)}%"
+          f" E1={chosen['e1']} dist={chosen['dist']:.1f}mm height={height_cm:.2f}cm")
     safe_udp_send(json.dumps({
-        "TARGET_E1": int(chosen["e1"]),
-        "STATION":   int(slot),
-        "ROUND":     int(round_num),
-        "PEAK_PCT":  round(chosen["pct"]*100, 1),
-        "PEAK_XY":   list(chosen["xy"]),
+        "TARGET_E1":  int(chosen["e1"]),
+        "STATION":    int(slot),
+        "ROUND":      int(round_num),
+        "PEAK_PCT":   round(chosen["pct"]*100, 1),
+        "PEAK_XY":    list(chosen["xy"]),
+        "HEIGHT_CM":  round(height_cm, 2),
     }))
-    print(f"[XCAP RESULT] slot={slot} round={round_num} pct_req={pct}% -> E1={chosen['e1']} xy={chosen['xy']}")
+
 
 def send_result_for_round(multi_peaks, station, rnd):
     if not multi_peaks:
-        print("[send_result_for_round] No peaks — skip"); return
+        print("[send_result_for_round] No peaks â€“ skip"); return
     threshold = [1.00, 0.65, 0.50][rnd] if rnd < 3 else 1.00
     label     = CAPTURE_ROUND_LABELS[rnd]  if rnd < 3 else "?"
+    print_all_peaks(multi_peaks, str(station), label=f"round={label}")
     chosen    = _pick_peak_by_pct(multi_peaks, threshold)
+    height_cm = chosen.get("height_cm", 0.0)
+    print(f"[UDP Result] [{label}] CHOSEN xy={chosen['xy']} pct={int(chosen['pct']*100)}%"
+          f" E1={chosen['e1']} dist={chosen['dist']:.1f}mm height={height_cm:.2f}cm")
     safe_udp_send(json.dumps({
-        "TARGET_E1": int(chosen["e1"]),
-        "STATION":   int(station),
-        "ROUND":     rnd+1,
-        "PEAK_PCT":  round(chosen["pct"]*100,1),
-        "PEAK_XY":   list(chosen["xy"]),
+        "TARGET_E1":  int(chosen["e1"]),
+        "STATION":    int(station),
+        "ROUND":      rnd+1,
+        "PEAK_PCT":   round(chosen["pct"]*100, 1),
+        "PEAK_XY":    list(chosen["xy"]),
+        "HEIGHT_CM":  round(height_cm, 2),
     }))
-    print(f"[UDP Result] [{label}] E1={chosen['e1']} xy={chosen['xy']}")
 
-# ── FLASK ────────────────────────────────────────────────────
+
+# â”€â”€ FLASK â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 app = Flask(__name__)
+
 
 def generate_frame():
     encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 65]
@@ -700,21 +902,25 @@ def generate_frame():
             _, enc = cv2.imencode('.jpg', frame, encode_param)
         yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + enc.tobytes() + b'\r\n')
 
+
 @app.route('/video_feed')
 def video_feed():
     return Response(generate_frame(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
+
 def start_flask():
     app.run(host='0.0.0.0', port=5002, threaded=True, debug=False, use_reloader=False)
 
-# ── YOLO GUARD ───────────────────────────────────────────────
+
+# â”€â”€ YOLO GUARD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def yolo_check_with_delay(get_frame_func, delay_sec=YOLO_DELAY_SEC,
                           rounds=YOLO_VOTE_ROUNDS, conf=YOLO_VOTE_CONF):
     print(f"[YOLO] Waiting {delay_sec}s before scan...")
     time.sleep(delay_sec)
-    vote_danger  = 0
-    all_detected = {}
-    annotated    = get_frame_func().copy()
+    vote_danger     = 0
+    all_detected    = {}
+    danger_conf_max = {}
+    annotated       = get_frame_func().copy()
     majority_needed = rounds // 2 + 1
     for rnd in range(rounds):
         frame   = get_frame_func()
@@ -724,22 +930,31 @@ def yolo_check_with_delay(get_frame_func, delay_sec=YOLO_DELAY_SEC,
             for box in r.boxes:
                 cls_id   = int(box.cls[0])
                 cls_name = YOLO_CLASS_NAMES.get(cls_id, f"class_{cls_id}")
-                all_detected[cls_name] = all_detected.get(cls_name,0) + 1
+                c_val    = float(box.conf[0])
+                all_detected[cls_name] = all_detected.get(cls_name, 0) + 1
                 if cls_id in DANGER_CLASSES:
                     found = True
+                    if cls_name not in danger_conf_max or c_val > danger_conf_max[cls_name]:
+                        danger_conf_max[cls_name] = c_val
                     b = box.xyxy[0].cpu().numpy()
                     cv2.rectangle(annotated,(int(b[0]),int(b[1])),(int(b[2]),int(b[3])),(0,0,255),3)
-                    cv2.putText(annotated,f"{cls_name} {float(box.conf[0]):.2f}",
+                    cv2.putText(annotated,f"{cls_name} {c_val:.2f}",
                                 (int(b[0]),max(int(b[1])-8,12)),cv2.FONT_HERSHEY_SIMPLEX,0.55,(0,0,255),2)
         if found:
             vote_danger += 1
         print(f"   [YOLO] Round {rnd+1}/{rounds}: {'DANGER' if found else 'SAFE'} | votes: {vote_danger}/{majority_needed}")
-    is_danger    = vote_danger >= majority_needed
-    danger_names = [n for n in all_detected if any(n==YOLO_CLASS_NAMES.get(c,'') for c in DANGER_CLASSES)]
-    print(f"[YOLO] {'DANGER' if is_danger else 'SAFE'} ({vote_danger}/{rounds} votes)")
+    is_danger = vote_danger >= majority_needed
+    if danger_conf_max:
+        best_name = max(danger_conf_max, key=danger_conf_max.get)
+        best_conf = danger_conf_max[best_name]
+        danger_names = [f"{best_name}({best_conf:.2f})"]
+    else:
+        danger_names = []
+    print(f"[YOLO] {'DANGER' if is_danger else 'SAFE'} ({vote_danger}/{rounds} votes) best={danger_names}")
     return is_danger, danger_names, annotated
 
-# ── X-CYCLE CAPTURE WORKER ───────────────────────────────────
+
+# â”€â”€ X-CYCLE CAPTURE WORKER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def xcap_worker():
     while True:
         if not xcap_trigger_event.wait(timeout=1.0):
@@ -784,10 +999,9 @@ def xcap_worker():
             state.analysis_ready.clear()
             state.xcap_meta           = meta.copy()
         print(f"[XCAP WORKER] analysis {ANALYSIS_SECONDS}s slot={slot} round={round_num}")
-        # ── ใช้ Event แทน busy-wait ───────────────────────────
         finished = state.analysis_ready.wait(timeout=ANALYSIS_SECONDS + 2.0)
         if not finished:
-            print("[XCAP WORKER] analysis timeout — sending last cached peaks")
+            print("[XCAP WORKER] analysis timeout â€“ sending last cached peaks")
         with multi_peaks_lock:
             peaks_now = list(multi_peaks_cache)
         with state.lock:
@@ -795,14 +1009,16 @@ def xcap_worker():
         if xcap_meta_now:
             send_result_for_xcap(peaks_now, xcap_meta_now)
 
-# ── PEAK DISPLAY COLORS ──────────────────────────────────────
+
+# â”€â”€ PEAK DISPLAY COLORS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 PEAK_COLORS          = [(0,255,255),(0,255,128),(0,165,255)]
 CLEAN_COLOR_CURRENT  = (0,0,255)
 CLEAN_COLOR_OTHER    = (0,0,160)
 CLEAN_RADIUS_CURRENT = 24
 CLEAN_RADIUS_OTHER   = 14
 
-# ── START THREADS ─────────────────────────────────────────────
+
+# â”€â”€ START THREADS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 threading.Thread(target=_open_serial,         daemon=True).start()
 threading.Thread(target=recv_cmd,             daemon=True).start()
 threading.Thread(target=read_ser,             daemon=True).start()
@@ -814,6 +1030,7 @@ threading.Thread(target=_red_blink_loop,      daemon=True).start()
 threading.Thread(target=xcap_worker,          daemon=True).start()
 threading.Thread(target=press_sensor_monitor, daemon=True).start()
 
+
 print("Pi Bridge & Vision system running...")
 cv2.namedWindow("Live Camera", cv2.WINDOW_NORMAL)
 
@@ -822,7 +1039,8 @@ debug_open      = False
 fps_times       = collections.deque(maxlen=30)
 _last_out_state = (None,None,None,None,None)
 
-# ── MAIN LOOP ─────────────────────────────────────────────────
+
+# â”€â”€ MAIN LOOP â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 try:
     while True:
         try:
@@ -864,47 +1082,71 @@ try:
         with emergency_lock:
             emerg_now = emergency_active
         press_active = press_sens.is_active
-        # ── OVERLAYS ─────────────────────────────────────────
+
+        with yolo_danger_lock:
+            yolo_active  = yolo_danger_display["active"]
+            yolo_classes = list(yolo_danger_display["classes"])
+
+        # â”€â”€ OVERLAYS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if emerg_now:
             red_ov = np.zeros_like(display); red_ov[:] = (0,0,80)
             display = cv2.addWeighted(display,0.75,red_ov,0.25,0)
             if int(time.time()*2)%2==0:
-                cv2.putText(display,"!! EMERGENCY !!",(60,240),cv2.FONT_HERSHEY_SIMPLEX,0.9,(0,0,255),3)
-                cv2.putText(display,"START DISABLED",(80,280),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,100,255),2)
+                cv2.putText(display,"           !! EMERGENCY !!",(60,240),cv2.FONT_HERSHEY_SIMPLEX,0.9,(0,0,255),3)
+                cv2.putText(display,"                  START DISABLED",(80,280),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,100,255),2)
+
         if is_running==1 and not press_active:
             warn_ov = np.zeros_like(display); warn_ov[:] = (0,60,120)
             display = cv2.addWeighted(display,0.75,warn_ov,0.25,0)
             if int(time.time()*3)%2==0:
                 cv2.putText(display,"!! GPIO22 LOST - AUTO STOP !!",(60,260),cv2.FONT_HERSHEY_SIMPLEX,0.85,(0,140,255),3)
+
+        if yolo_active and int(time.time() * 2) % 2 == 0:
+            raw_cls    = yolo_classes[0] if yolo_classes else "obstacle"
+            class_str  = raw_cls
+            lines      = ["Detect", class_str, "Stop Process"]
+            y_positions = [220, 265, 310]
+            for line, y in zip(lines, y_positions):
+                (tw, _), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 3)
+                tx = (640 - tw) // 2
+                cv2.putText(display, line, (tx, y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+
         with xcap_lock:
             xcap_now = xcap_pending
         if xcap_now and frozen:
             cv2.putText(display,f"[X-CYCLE] slot={xcap_now['slot']} round={xcap_now['round_num']} pct={xcap_now['pct']}%",
                         (20,420),cv2.FONT_HERSHEY_SIMPLEX,0.55,(0,220,255),2)
-        # ── DEBUG / CLEAN MODE ────────────────────────────────
+
+        # â”€â”€ DEBUG / CLEAN MODE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if show_debug:
             if heat_ov is not None:
                 display = cv2.addWeighted(display,0.60,heat_ov,0.40,0)
             cv2.polylines(display,[rois[current_station]],True,(255,0,255),2)
             for i,pk in enumerate(multi_peaks_display):
-                px,py   = pk["xy"]; pct_val=pk["pct"]; e1v=pk["e1"]
-                color   = PEAK_COLORS[i] if i < len(PEAK_COLORS) else (200,200,200)
-                radius  = [22,18,14][i] if i<3 else 10
-                thr_pct = int([100,65,50][i]) if i<3 else 0
+                px,py     = pk["xy"]; pct_val=pk["pct"]; e1v=pk["e1"]
+                height_cm = pk.get("height_cm", 0.0)
+                color     = PEAK_COLORS[i] if i < len(PEAK_COLORS) else (200,200,200)
+                radius    = [22,18,14][i] if i<3 else 10
+                thr_pct   = int([100,65,50][i]) if i<3 else 0
                 cv2.circle(display,(px,py),radius,color,2)
                 cv2.drawMarker(display,(px,py),color,cv2.MARKER_CROSS,30,2)
-                cv2.putText(display,f"#{i+1} {int(pct_val*100)}% E1:{e1v}",(px+25,py+5),cv2.FONT_HERSHEY_SIMPLEX,0.45,color,1)
+                cv2.putText(display,f"#{i+1} {int(pct_val*100)}% E1:{e1v} h:{height_cm:.1f}cm",
+                            (px+25,py+5),cv2.FONT_HERSHEY_SIMPLEX,0.45,color,1)
                 if i==cur_rnd:
                     cv2.circle(display,(px,py),radius+6,(255,255,255),1)
                     cv2.putText(display,f"NEXT({thr_pct}%)",(px+25,py+20),cv2.FONT_HERSHEY_SIMPLEX,0.40,(255,255,255),1)
-            if peak_xy and bump_map is not None:
-                tx,ty = peak_xy; bh = float(bump_map[ty,tx])
-                cv2.putText(display,f"bump:{bh:+.1f}mm",(tx+28,ty+30),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,255,255),1)
+            if peak_xy:
+                tx,ty = peak_xy
+                h_cm  = dist_to_height_cm(float(depth_live[ty,tx]) if not frozen else dist_mm,
+                                          station=current_station)
+                cv2.putText(display,f"h:{h_cm:.1f}cm",(tx+28,ty+30),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,255,255),1)
             if ai_xy:
                 cv2.circle(display,ai_xy,14,(0,255,0),2)
                 cv2.putText(display,"AI",(ai_xy[0]+16,ai_xy[1]+6),cv2.FONT_HERSHEY_SIMPLEX,0.48,(0,255,0),1)
             cv2.putText(display,f"E1: {int(e1_val)}",(20,60),2,0.8,(0,255,255),2)
-            cv2.putText(display,f"Dist: {dist_mm:.1f}mm",(20,95),2,0.7,(255,255,255),2)
+            height_primary_cm = dist_to_height_cm(dist_mm, station=current_station)
+            cv2.putText(display,f"Dist: {dist_mm:.1f}mm  h:{height_primary_cm:.1f}cm",(20,95),2,0.6,(255,255,255),2)
             cv2.putText(display,f"ST:{current_station}",(20,130),2,0.6,(200,200,200),1)
             rnd_label = CAPTURE_ROUND_LABELS[display_rnd] if display_rnd<3 else "?"
             cv2.putText(display,f"Round: {rnd_label}",(20,160),cv2.FONT_HERSHEY_SIMPLEX,0.55,(255,200,0),1)
@@ -912,19 +1154,32 @@ try:
             cv2.putText(display,"EMERG:ON" if emerg_now else "EMERG:OFF",(20,190),cv2.FONT_HERSHEY_SIMPLEX,0.55,emerg_col,1)
             press_col = (0,255,0) if press_active else (0,0,255)
             cv2.putText(display,"GPIO22:ON" if press_active else "GPIO22:OFF",(20,215),cv2.FONT_HERSHEY_SIMPLEX,0.55,press_col,1)
+            yolo_col = (0,0,255) if yolo_active else (0,255,0)
+            yolo_txt = f"ROS-YOLO:DANGER ({', '.join(yolo_classes)})" if yolo_active else "ROS-YOLO:SAFE"
+            cv2.putText(display, yolo_txt, (20,240), cv2.FONT_HERSHEY_SIMPLEX, 0.48, yolo_col, 1)
         else:
             if multi_peaks_display:
                 thr = [1.00,0.65,0.50][display_rnd] if display_rnd<3 else 1.00
                 pk  = _pick_peak_by_pct(multi_peaks_display, thr)
-                px,py = pk["xy"]
+                px,py     = pk["xy"]
+                height_cm = pk.get("height_cm", 0.0)
                 cv2.circle(display,(px,py),24,(0,255,255),3)
                 cv2.drawMarker(display,(px,py),(0,255,255),cv2.MARKER_CROSS,44,2)
-        # ── HUD ──────────────────────────────────────────────
+                cv2.putText(display,f"h:{height_cm:.1f}cm",(px+28,py-10),
+                            cv2.FONT_HERSHEY_SIMPLEX,0.55,(0,255,255),2)
+
+        # â”€â”€ HUD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         fps_times.append(cv2.getTickCount())
         fps = ((len(fps_times)-1)*cv2.getTickFrequency()/(fps_times[-1]-fps_times[0]) if len(fps_times)>=2 else 0)
         press_hud_col = (0,255,0) if press_active else (0,100,255)
         cv2.putText(display,f"ST:{current_station} {fps:.1f}FPS",(20,30),cv2.FONT_HERSHEY_SIMPLEX,0.6,(200,200,200),1)
         cv2.putText(display,"PRESS:ON" if press_active else "PRESS:OFF(START BLOCKED)",(200,30),cv2.FONT_HERSHEY_SIMPLEX,0.5,press_hud_col,1)
+
+        yolo_ind_col = (0, 0, 255) if yolo_active else (0, 200, 0)
+        yolo_ind_txt = "YOLO:DANGER" if yolo_active else "YOLO:SAFE"
+        cv2.putText(display, yolo_ind_txt, (430, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, yolo_ind_col, 1)
+
         if frozen:
             pct_bar = countdown/ANALYSIS_SECONDS
             bar_w   = int(600*pct_bar)
@@ -934,24 +1189,29 @@ try:
         else:
             mode_txt = "[DEBUG]" if show_debug else "[CLEAN]"
             cv2.putText(display,f"{mode_txt}  [d] Debug | [Space] Capture",(20,455),cv2.FONT_HERSHEY_SIMPLEX,0.50,(180,180,180),1)
+
         cv2.circle(display,(620,20),8,(0,165,255) if processing else (0,255,0),-1)
         cv2.circle(display,(600,20),8,(0,0,255) if emerg_now else (100,100,100),-1)
         cv2.putText(display,"E",(594,24),cv2.FONT_HERSHEY_SIMPLEX,0.35,(255,255,255),1)
+
         _cur_out_state = (lamp_green.is_active,lamp_red.is_active,lamp_blue.is_active,bool(is_running),emerg_now)
         if _cur_out_state != _last_out_state:
             _last_out_state = _cur_out_state
             g,r,b,run,emg  = _cur_out_state
             print(f"[PI OUTPUTS] GPIO23-GREEN:{'ON ' if g else 'OFF'}  GPIO24-RED:{'ON ' if r else 'OFF'}  GPIO25-BLUE:{'ON ' if b else 'OFF'}  RUNNING:{'ON ' if run else 'OFF'}  EMERGENCY:{'ON ' if emg else 'OFF'}")
+
         with stream_lock:
             last_captured_frame = display.copy()
         cv2.imshow('Live Camera', display)
+
         if show_debug and dbg_grid is not None:
             cv2.imshow('Light Analysis Debug', dbg_grid); debug_open = True
         elif not show_debug and debug_open:
             try: cv2.destroyWindow('Light Analysis Debug')
             except: pass
             debug_open = False
-        # ── CHECK ANALYSIS DONE ───────────────────────────────
+
+        # â”€â”€ CHECK ANALYSIS DONE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         just_finished = False; xcap_meta_done = None; rnd_just_done = None
         with state.lock:
             if state.analysis_done_flag:
@@ -980,7 +1240,8 @@ try:
                         capture_round = (done_rnd+1) % 3
                     print(f"capture_round -> {capture_round} ({CAPTURE_ROUND_LABELS[capture_round]})")
                 threading.Thread(target=_advance_round, args=(rnd_just_done,), daemon=True).start()
-        # ── KEYBOARD ─────────────────────────────────────────
+
+        # â”€â”€ KEYBOARD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         key        = cv2.waitKey(1) & 0xFF
         do_capture = False
         if auto_capture_trigger:
@@ -1000,7 +1261,7 @@ try:
             with emergency_lock:
                 emerg = emergency_active
             if emerg:
-                print("[CAMERA] Capture blocked — Emergency active!")
+                print("[CAMERA] Capture blocked â€“ Emergency active!")
             else:
                 snap_img_pre = img_live.copy()
                 filtered_df  = spatial.process(raw_df)
@@ -1030,8 +1291,10 @@ try:
                         state.analysis_ready.clear()
                         state.xcap_meta           = None
                         state.snap_round          = locked_rnd
-                    print(f"[CAMERA] Safe — analysis started [{CAPTURE_ROUND_LABELS[locked_rnd]}]")
+                    print(f"[CAMERA] Safe â€“ analysis started [{CAPTURE_ROUND_LABELS[locked_rnd]}]")
 finally:
     stop_event.set()
     pipeline.stop()
     cv2.destroyAllWindows()
+
+
