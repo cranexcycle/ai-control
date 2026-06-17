@@ -1,1003 +1,279 @@
-# CRANEAI EXTREME — แพ็คเกจ ROS2 
-**ฉบับสมบูรณ์ | คู่มืออ้างอิงและการติดตั้งฉบับสมบูรณ์**
+# CraneAI — AI-Controlled Sand/Stone Machine
+### เอกสารสรุปโครงสร้างและการใช้งาน Web App
 
-
----
-
-## ส่วนประกอบเวอร์ชัน / ข้อมูลจำเพาะ
-
-| รายการ | ค่า |
-|---|---|
-| ROS2 | Humble (Ubuntu 22.04 LTS) |
-| Simulator | Gazebo Classic (gazebo_ros2_control) |
-| โมเดล AI | YOLOv8n + ONNX Runtime (Model_Fix.onnx) |
-| กล้อง | Intel RealSense D435 |
-| ตัวควบคุม | Raspberry Pi 5 (RAM 8GB) |
-| เฟิร์มแวร์ | STM32F103C8T6 (Arduino) |
-| เว็บ Frontend | Node.js v18+ + rosbridge WebSocket |
-| ข้อต่อ URDF | headcrane_Link (revolute) + armcrane_Link (prismatic) |
-| ซอฟต์แวร์ CAD | SolidWorks + sw2urdf exporter |
+**Stack:** Google AI Studio · React + Vite · ROS2 · Gemini API
 
 ---
 
-## 1. ภาพรวมระบบ (System Overview)
+## 1. ภาพรวมโครงการ (Project Overview)
 
-ระบบ CraneAI Extreme เป็นระบบควบคุมอัตโนมัติที่ประกอบด้วย ROS2, Gazebo Simulator, AI (YOLOv8 + ONNX), กล้อง Intel RealSense D435 และฮาร์ดแวร์จริง (Raspberry Pi 5 + STM32F103) รองรับโหมดการทำงาน Full-Auto, Semi-Auto และ Manual ผ่าน Web UI หรือ CLI
+CraneAI คือระบบควบคุมเครนแบบอัตโนมัติสำหรับการเตรียมหิน/ทรายในกระบวนการผลิตคอนกรีต พัฒนาด้วย Google AI Studio โดยใช้ AI (Gemini) ช่วยตรวจจับจุดตักวัสดุผ่านกล้อง Depth Camera แบบ Real-time
 
-### 1.1 การไหลของข้อมูล
+ระบบแบ่งออกเป็น 2 ส่วนหลัก:
 
-| ทิศทาง | โปรโตคอล | รายละเอียด |
+- **Frontend (Web App)** — React + Vite + Tailwind CSS แสดงผลใน Browser
+- **Backend (ROS2 Node)** — Python ควบคุม Hardware จริง (เครน + Encoder + Sensor)
+
+---
+
+## 2. ไฟล์ในโครงการ (Project Files)
+
+| ชื่อไฟล์ | ประเภท | หน้าที่ |
 |---|---|---|
-| STM32 → Pi | Serial UART 115200 | ส่ง E1, E2, P1–P4, LS1–LS2 ทุก 20ms |
-| Pi → ROS PC | UDP Port 5000 | ส่งสถานะ JSON + ผล Vision (TARGET_E1) |
-| ROS PC → Pi | UDP Port 5001 | ส่งคำสั่ง MAG/VALVE/STM32 + XCAP request |
-| Pi → STM32 | Serial UART 115200 | ส่งคำสั่ง ARM/START/MAG_ON/VALVE ฯลฯ |
-| Web UI → ROS | WebSocket :9090 | ส่งคำสั่ง c1/c2/c3/x/h ผ่าน rosbridge |
-| ROS → Gazebo | Topic JointTrajectory | sync กับโมเดลเสมือน |
+| `src/App.tsx` | Frontend / React | ไฟล์หลักของ Web App — UI ทั้งหมด 7 หน้า, เชื่อม ROS2, รับ-ส่งคำสั่งเครน |
+| `src/main.tsx` | Frontend | Entry point ของ React — mount `App.tsx` เข้า `index.html` |
+| `src/index.css` | Frontend | Tailwind CSS base styles |
+| `src/lib/utils.ts` | Frontend | Helper function สำหรับ className (`cn` utility) |
+| `index.html` | Frontend | HTML root template — โหลด React และ ROSLIB script |
+| `app.py` | Backend / ROS2 | ROS2 Node หลัก — รับคำสั่งจาก Web ผ่าน UDP, ควบคุม Encoder + Limit Switch + Digital Twin (Gazebo) |
+| `crane_control_node.py` | Backend / ROS2 | ROS2 Node ควบคุมเครนเวอร์ชันแรก — BangBang Control, Homing, Cycle Auto |
+| `crane_control_node_fixed.py` | Backend / ROS2 | เวอร์ชันแก้ไข/เสถียรกว่า — ปรับ Debounce, Limit Switch และ Brake logic |
+| `vite.config.ts` | Config | ตั้งค่า Vite — inject `GEMINI_API_KEY`, alias path `@/` |
+| `tsconfig.json` | Config | ตั้งค่า TypeScript compiler |
+| `package.json` | Config | รายการ dependencies (React, Recharts, Roslib, Gemini SDK, Motion) |
+| `.env.example` | Config | ตัวอย่างตั้งค่า `GEMINI_API_KEY` และ `APP_URL` |
+| `metadata.json` | AI Studio | ข้อมูลโปรเจกต์สำหรับ Google AI Studio |
+| `public/logo/` | Assets | โลโก้ KMUTNB และโลโก้โครงการ (`logo.png`, `logo2.png`) |
+| `public/GALLERY/` | Assets | รูปภาพเครนจริง ~47 ภาพ แสดงในหน้า Gallery |
+| `public/person/` | Assets | รูปสมาชิกทีม 7 คน (`person0`–`person6`) แสดงในหน้า Developers |
 
 ---
 
-## 2. System Requirements
+## 3. หน้าของ Web App (7 หน้า)
 
-### 2.1 PC / Notebook (ROS PC)
+Web App มีทั้งหมด 7 หน้า เปลี่ยนด้วย Sidebar เมนูซ้ายมือ
 
-| รายการ | ข้อกำหนด |
-|---|---|
-| OS | Windows 10/11 (64-bit) + WSL2 Ubuntu 22.04 LTS |
-| CPU | Intel Core i5 / AMD Ryzen 5 หรือดีกว่า |
-| RAM | ขั้นต่ำ 8 GB (แนะนำ 16 GB) |
-| GPU | (ไม่จำเป็น) สำหรับ YOLO inference |
-| Network | LAN หรือ Wi-Fi เชื่อม Raspberry Pi |
-
-### 2.2 Raspberry Pi 5
-
-- Raspberry Pi 5 (RAM 8 GB)
-- Ubuntu 22.04 LTS (64-bit) บน microSD ≥ 32 GB
-- Intel RealSense D435 ต่อ USB 3.0
-- Python 3.10 ขึ้นไป
-
-### 2.3 ซอฟต์แวร์ที่ต้องใช้
-
-| โปรแกรม | ติดตั้งบน | หมายเหตุ |
+| หน้า (View) | ชื่อเมนู | ทำอะไรได้บ้าง |
 |---|---|---|
-| Python 3.x | Windows + Pi | ดาวน์โหลดจาก python.org |
-| Radmin VPN | Windows | สำหรับผ่านอินเทอร์เน็ต (ถ้าไม่มี LAN) |
-| WSL2 + Ubuntu 22.04 | Windows | ติดตั้งผ่าน PowerShell |
-| ROS2 Humble | Ubuntu (WSL2) + Pi | รองรับผ่าน apt |
-| Node.js v18+ | Ubuntu (WSL2) | สำหรับ Web Frontend |
-| Git | Ubuntu (WSL2) + Pi | sudo apt install git |
-| Intel RealSense SDK | Raspberry Pi | librealsense2 |
-| YOLOv8 (ultralytics) | Pi + Ubuntu | pip install ultralytics |
-| ONNX Runtime | Pi + Ubuntu | pip install onnxruntime |
+| `main` | OPERATION | หน้าหลักควบคุมเครน — ดูภาพจากกล้อง, กด Slot 1/2/3, Start/Stop, ดู Encoder & Sensor แบบ Real-time |
+| `result` | RESULT | สถิติการทำงาน — ดู Log สำเร็จ/ล้มเหลว, กราฟ Sensor, นับ cycle, แสดงเวลาแบบ Real-time |
+| `status` | STATUS | ตารางสถานะอุปกรณ์ทั้งหมด — Encoder 1/2, Photo Sensor 1-4, Limit Switch, Camera, Pressure |
+| `info` | INFO | ข้อมูลโครงการ — อ่านรายละเอียด Vision, Feature Cards, ปุ่มไปหน้า Developers |
+| `gallery` | GALLERY | แกลเลอรีภาพเครนจริง ~47 ภาพ — คลิกขยายภาพ, เลื่อนดูทั้งหมด |
+| `3d` | 3D POINT CLOUD | แผนที่ความสูง Height Map แบบ Real-time — แสดง Point Cloud 3D จาก RealSense, Color Gradient ตามความสูงวัสดุ, RViz-style ใน Browser |
+| `dev` | DEVELOPERS | หน้าทีมพัฒนา — รูปและชื่อสมาชิก 7 คน |
+
+### รายละเอียดแต่ละหน้า
+
+**หน้า 1 — OPERATION (main)**
+- แสดง Video Stream จากกล้อง Intel RealSense (กรอก URL ใน Settings)
+- แสดง Encoder Position, Sensor สถานะ (Photo 1-3) แบบ Live
+- ปุ่ม SLOT 1 / SLOT 2 / SLOT 3 — ส่งคำสั่งไปยัง ROS2 ให้เครนเคลื่อนที่
+- ปุ่ม HOME — เรียก Homing Sequence
+- ปุ่ม START / STOP — เริ่ม/หยุดระบบ
+- ปุ่ม Settings — ตั้งค่า WebSocket URL และ Camera URL
+- รองรับภาษาไทย/อังกฤษ (toggle TH/EN)
+
+**หน้า 2 — RESULT**
+- Log รายการ Cycle สำเร็จ พร้อมเวลา
+- Log รายการ Error/ล้มเหลว พร้อม Error Code
+- นับ Cycle ทั้งหมด, Latency, เวลาระบบ
+
+**หน้า 3 — STATUS**
+- ตารางอุปกรณ์ 10 รายการ: Encoder1, Encoder2, Photo1-4, Limit Switch1-2, Camera, Pressure
+- แสดง ON/OFF หรือค่าตัวเลขตาม Real-time data จาก ROS2
+- บอกสถานะว่า Online/Offline แต่ละตัว
+
+**หน้า 4 — INFO**
+- อธิบาย Vision ของโครงการ (ปัญหาที่แก้, แนวทาง AI + Computer Vision)
+- Feature Cards: Smart Vision, Automated Batching, Real-time Monitoring, Safety
+- ปุ่มไปดูทีมพัฒนา
+
+**หน้า 5 — GALLERY**
+- กริดรูปภาพเครนจริงประมาณ 47 ภาพ
+- คลิกที่รูปเพื่อขยายดู Fullscreen
+
+**หน้า 6 — 3D POINT CLOUD (/3d)**
+- แสดง Height Map แบบ 3D Point Cloud Real-time จากกล้อง Intel RealSense D435
+- Color Gradient ตามระดับความสูงวัสดุ (น้ำเงิน = ต่ำ → แดง = สูง)
+- รับข้อมูล Depth Grid ผ่าน WebSocket จาก Pi Bridge (`app.py`) — อัปเดตทุก ~50ms
+- แสดงผล RViz-style ใน Browser — ใช้ข้อมูลชุดเดียวกับ RViz เพื่อ debug ได้พร้อมกัน
+- รองรับ per-station calibration — สลับสถานี 1/2/3 เพื่อโหลดค่า height offset ที่ถูกต้องของแต่ละกอง
+
+**หน้า 7 — DEVELOPERS**
+- แสดงรูปและชื่อสมาชิกทีม 7 คน
 
 ---
 
-## 3. ขั้นตอนการติดตั้ง
+## 4. Features ของ Web App
 
-> ⚠️ **รีสตาร์ท Windows 1 ครั้งในส่วน WSL2 — บันทึกงานทั้งหมดก่อนเริ่ม**
-
-### 3.1 ติดตั้ง WSL2 + Ubuntu 22.04 บน Windows
-
-**ขั้นตอนที่ 1 — เปิดใช้งาน WSL2 (PowerShell Administrator)**
-
-```powershell
-# คลิกขวา Start Menu → Windows PowerShell (Admin)
-wsl --install
-wsl --set-default-version 2
-
-# รีสตาร์ท Windows จากนั้นเปิด PowerShell ใหม่
-wsl --install -d Ubuntu-22.04
-
-# ตรวจสอบ
-wsl --list --verbose
-# ผลที่ต้องได้: Ubuntu-22.04 Running 2
-```
-
-**ขั้นตอนที่ 2 — ติดตั้ง Ubuntu ครั้งแรก**
-
-หลังจากติดตั้งเสร็จ Ubuntu จะขอให้ตั้ง username/password จากนั้นรัน:
-
-```bash
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y curl gnupg2 lsb-release build-essential git
-```
-
-**ขั้นตอนที่ 3 — ติดตั้ง Python บน Windows (สำหรับ udp_bridge.py)**
-
-ดาวน์โหลด Python 3.x จาก https://python.org/downloads
-ติ๊ก **"Add Python to PATH"** ระหว่างติดตั้ง จากนั้นตรวจสอบ:
-
-```cmd
-python --version
-```
-
----
-
-### 3.2 ติดตั้ง ROS2 Humble (Ubuntu 22.04 / WSL2)
-
-> 📌 ดำเนินการใน **Ubuntu Terminal (WSL2)** — เปิดโดยพิมพ์ `Ubuntu` ใน Windows Search
-
-**ขั้นตอนที่ 4 — ตั้งค่า Locale**
-
-```bash
-sudo locale-gen en_US en_US.UTF-8
-sudo update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-export LANG=en_US.UTF-8
-```
-
-**ขั้นตอนที่ 5 — เพิ่ม ROS2 Repository**
-
-```bash
-sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
-  -o /usr/share/keyrings/ros-archive-keyring.gpg
-
-echo "deb [arch=$(dpkg --print-architecture) \
-  signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] \
-  http://packages.ros.org/ros2/ubuntu jammy main" \
-  | sudo tee /etc/apt/sources.list.d/ros2.list > /dev/null
-
-sudo apt update
-```
-
-**ขั้นตอนที่ 6 — ติดตั้ง ROS2 Humble Desktop**
-
-```bash
-sudo apt install -y ros-humble-desktop-full
-
-# เพิ่ม source ใน .bashrc (ทำครั้งเดียว)
-echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc
-source ~/.bashrc
-
-# ตรวจสอบ
-ros2 --version   # ผลที่ต้องได้: ros2 distro: humble
-```
-
-**ขั้นตอนที่ 7 — ติดตั้งแพ็คเกจ ROS2 เพิ่มเติม**
-
-```bash
-sudo apt update && sudo apt install -y \
-  ros-humble-ros2-control \
-  ros-humble-gazebo-ros2-control \
-  ros-humble-joint-trajectory-controller \
-  ros-humble-joint-state-broadcaster \
-  ros-humble-controller-manager \
-  ros-humble-robot-state-publisher \
-  ros-humble-joint-state-publisher-gui \
-  ros-humble-rviz2 \
-  ros-humble-rosbridge-suite
-```
-
-**ขั้นตอนที่ 8 — ติดตั้ง Python Libraries (Ubuntu WSL2)**
-
-```bash
-pip install ultralytics opencv-python numpy
-pip install flask onnxruntime
-
-# ตรวจสอบ ONNX
-python3 -c "import onnxruntime; print(onnxruntime.__version__)"
-```
-
----
-
-### 3.3 สร้าง ROS2 Workspace และ Copy โปรแกรม
-
-**ขั้นตอนที่ 9 — สร้าง Workspace**
-
-```bash
-mkdir -p ~/dev_ws/ros2_ws/src
-cd ~/dev_ws/ros2_ws
-colcon build --symlink-install
-source install/setup.bash
-echo "source ~/dev_ws/ros2_ws/install/setup.bash" >> ~/.bashrc
-```
-
-**ขั้นตอนที่ 10 — คัดลอกแพ็คเกจ crane_motor**
-
-คัดลอกโฟลเดอร์ `crane_motor` ไปยัง `~/dev_ws/ros2_ws/src/crane_motor/`
-
-โครงสร้างโฟลเดอร์ที่ต้องมี:
-
-```
-src/crane_motor/
-├── scripts/
-│   ├── mainROS.py
-│   └── teleop_crane_motor.py
-├── urdf/
-│   └── cranemotor.urdf
-├── config/
-│   └── controllers.yaml
-├── launch/
-│   └── display.launch.py
-├── CMakeLists.txt
-└── package.xml
-```
-
-**ขั้นตอนที่ 11 — Build แพ็คเกจ**
-
-```bash
-cd ~/dev_ws/ros2_ws
-colcon build --symlink-install
-source install/setup.bash
-
-# ตรวจสอบ
-ros2 pkg list | grep crane   # ผลที่ต้องได้: crane_motor
-```
-
----
-
-### 3.4 ติดตั้งโปรแกรมบน Raspberry Pi 5
-
-**ขั้นตอนที่ 12 — ติดตั้ง ROS2 Humble บน Pi**
-
-ทำขั้นตอนเดียวกับหัวข้อ 3.2 (ขั้นตอนที่ 4–7) บน Pi Terminal
-
-**ขั้นตอนที่ 13 — ติดตั้ง Python Libraries บน Pi**
-
-```bash
-pip install ultralytics opencv-python numpy
-pip install pyrealsense2 flask onnxruntime gpiozero
-
-# ตรวจสอบ RealSense
-python3 -c "import pyrealsense2; print('RealSense OK')"
-```
-
-**ขั้นตอนที่ 14 — สร้าง Workspace บน Pi**
-
-```bash
-mkdir -p ~/dev_ws
-cd ~/dev_ws
-# ไฟล์ที่ต้องมี:
-# - mainPI.py
-# - Model_Fix.onnx
-```
-
-**ขั้นตอนที่ 15 — ตั้งค่าสิทธิ์ Serial**
-
-```bash
-# ให้สิทธิ์ user เข้าถึง USB Serial (ทำครั้งเดียว)
-sudo usermod -aG dialout $USER
-sudo reboot
-
-# ตรวจสอบหลัง reboot
-ls /dev/ttyUSB*   # ผลที่ต้องได้: /dev/ttyUSB0
-```
-
-**ขั้นตอนที่ 16 — ติดตั้ง Intel RealSense SDK**
-
-```bash
-sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-key F6E65AC044F831AC
-sudo add-apt-repository "deb https://librealsense.intel.com/Debian/apt-repo $(lsb_release -cs) main"
-sudo apt update
-sudo apt install -y librealsense2-dkms librealsense2-utils librealsense2-dev
-
-# ตรวจสอบ (เสียบกล้องก่อน)
-realsense-viewer
-```
-
-**ขั้นตอนที่ 17 — คัดลอก Model_Fix.onnx ไปยัง Pi**
-
-```bash
-# วิธีที่ 1: ใช้ SCP จาก PC
-scp Model_Fix.onnx pi@<PI_IP>:~/dev_ws/
-
-# วิธีที่ 2: ใช้ USB Flash Drive
-# Copy ไฟล์ใส่ USB → เสียบ Pi → cp /media/.../Model_Fix.onnx ~/dev_ws/
-```
-
----
-
-### 3.5 ตั้งค่าเครือข่าย (Network Configuration)
-
-| อุปกรณ์ | IP Address |
+| Feature | รายละเอียด |
 |---|---|
-| PC (Notebook ROS) | 10.0.0.1 (Static IP) |
-| Raspberry Pi 5 | 10.0.0.2 (Static IP) |
-
-**ขั้นตอนที่ 18 — ตั้ง IP แบบคงที่บน Windows**
-
-เปิด การตั้งค่า → เครือข่ายและอินเทอร์เน็ต → Ethernet → การกำหนด IP → แก้ไข → กำหนดเอง
-IPv4: เปิด → IP: `10.0.0.1`, Subnet: `255.255.255.0`
-
-**ขั้นตอนที่ 19 — ตั้ง Static IP บน Raspberry Pi**
-
-```bash
-sudo nano /etc/dhcpcd.conf
-
-# เพิ่มบรรทัดต่อไปนี้ที่ท้ายไฟล์:
-interface eth0
-static ip_address=10.0.0.2/24
-static routers=10.0.0.1
-
-# บันทึกและ reboot
-sudo reboot
-
-# ทดสอบ ping จาก PC
-ping 10.0.0.2
-```
-
-**ขั้นตอนที่ 20 — แก้ไข IP ใน udp_bridge.py (Windows)**
-
-```python
-TARGET_IP = "10.0.0.2"   # IP ของ Raspberry Pi
-TARGET_PORT = 5001
-```
-
-**ขั้นตอนที่ 21 — แก้ไข IP ใน mainROS.py (Ubuntu)**
-
-```python
-PI_IP = "10.0.0.2"
-PI_PORT = 5001
-LISTEN_PORT = 5001
-CAMERA_STREAM_URL = "http://10.0.0.2:5002/video_feed"
-```
+| ควบคุมเครนผ่านเว็บ | กดปุ่ม Slot / Home / Start / Stop — ส่งคำสั่งไป ROS2 แบบ Realtime ผ่าน WebSocket |
+| ดูภาพกล้อง Live | แสดง Video Stream จาก Intel RealSense Depth Camera บนหน้าหลัก |
+| Monitor Sensor | Encoder Position, Photo Sensor, Limit Switch, Pressure อัปเดตทุก ~50ms |
+| ดู Log & สถิติ | บันทึก Cycle สำเร็จ/ล้มเหลว, กราฟ History, Latency, นับรอบการทำงาน |
+| รองรับ 2 ภาษา | สลับไทย/อังกฤษได้ทุกหน้า ทุกข้อความ |
+| ปรับ URL ได้ | ตั้งค่า ROSBridge WebSocket URL และ Camera Stream URL ผ่านหน้า Settings |
+| Responsive Design | รองรับทั้ง Desktop (Sidebar ซ้าย) และ Mobile (Sidebar ซ่อน/เปิดได้) |
+| Animation | ใช้ Framer Motion (motion library) ทำ Page Transition และ Fade-in Effect |
+| Gallery ภาพเครนจริง | รูปภาพงานจริง 47 ภาพ คลิกดูแบบ Fullscreen ได้ |
 
 ---
 
-### 3.6 ติดตั้ง Web Frontend (craneaiextreme)
+## 5. วิธีใช้งาน Web App
 
-**ขั้นตอนที่ 22 — ติดตั้ง Node.js**
+### 5.1 เตรียมก่อนใช้
+
+ต้องรัน **ROS2 + ROSBridge** บนเครื่องที่เชื่อมต่อกับเครนก่อนเริ่มใช้งาน
+
+---
+
+### 5.2 รันด้วย Antigravity IDE (Google AI-Native IDE)
+
+Antigravity คือ IDE ของ Google ที่สร้างมาสำหรับ AI-assisted development โดยเฉพาะ — หน้าตาคล้าย VS Code แต่มี AI Agent (Gemini 3) ทำงานให้อัตโนมัติ สามารถใช้รันโปรเจกต์ CraneAI ได้โดยตรง
+
+**ขั้นตอนการรัน CraneAI ใน Antigravity:**
+
+1. เปิด Antigravity IDE — ดาวน์โหลดจาก `antigravity.google/download` แล้วติดตั้ง
+2. กด **Open Folder** แล้วเลือก folder ที่แตก ZIP โปรเจกต์ CraneAI ไว้
+3. เปิด Terminal ใน Antigravity (`Ctrl + ` ` หรือ View > Terminal) แล้วรัน:
 
 ```bash
-# ใน Ubuntu (WSL2)
-curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
-sudo apt install -y nodejs
-node --version   # ต้องได้ >= 18
-```
-
-**ขั้นตอนที่ 23 — ติดตั้ง Dependencies และรัน**
-
-```bash
-cd craneaiextreme
-cp .env.example .env
-
-# แก้ไข .env — ใส่ GEMINI_API_KEY จริง
-nano .env
-
 npm install
-npm run dev   # Web UI พร้อมใช้งานที่ http://localhost:3000
 ```
 
----
-
-### 3.7 Verification Checklist
+4. พิมพ์ใน Terminal แล้วกด Enter — Antigravity จะเปิด Browser Preview อัตโนมัติ:
 
 ```bash
-# 1. ตรวจสอบ ROS2
-ros2 --version
-# ผลที่ต้องได้: ros2 distro: humble
+npm run dev
+```
 
-# 2. ตรวจสอบ package
-ros2 pkg list | grep crane
-# ผลที่ต้องได้: crane_motor
+5. ถ้า Browser ไม่เปิดเอง ให้เปิดด้วยตนเองที่:
 
-# 3. ตรวจสอบ ONNX (Ubuntu)
-python3 -c "import onnxruntime; print('OK')"
+```
+http://localhost:3000
+```
 
-# 4. ตรวจสอบ RealSense (Pi)
-python3 -c "import pyrealsense2; print('OK')"
+6. ใช้ Agent Chat ใน Antigravity พิมพ์คำสั่งเป็นภาษาธรรมดา เช่น
 
-# 5. ทดสอบ ping (จาก PC)
-ping 10.0.0.2
-# ผลที่ต้องได้: Reply from 10.0.0.2
+```
+แก้ไขสีปุ่ม SLOT ให้เป็นสีแดง
+```
 
-# 6. ตรวจสอบ Serial (Pi)
-ls /dev/ttyUSB*
-# ผลที่ต้องได้: /dev/ttyUSB0
+— Agent จะแก้ Code ให้อัตโนมัติ
 
-# 7. ตรวจสอบ Node.js (Ubuntu)
-node --version
-# ผลที่ต้องได้: >= v18.x.x
+**เคล็ดลับการใช้ Antigravity กับ CraneAI:**
+
+- ใช้ Agent Chat ถามเกี่ยวกับ Code ได้เลย เช่น `"ไฟล์ App.tsx ทำอะไร?"` หรือ `"เพิ่ม Slot 4 ให้ด้วย"`
+- Antigravity อ่านไฟล์ทั้งโปรเจกต์ได้ในครั้งเดียว (2M token context) — เหมาะสำหรับ Debug
+- มี Browser Preview built-in — ทดสอบ UI ได้ทันทีโดยไม่ต้องออกจาก IDE
+- รองรับ Multi-agent: ให้ Agent หนึ่งแก้ Frontend ขณะที่อีกตัวดู ROS2 Node
+
+---
+
+### 5.3 รันบน Google AI Studio (ออนไลน์ ไม่ต้องติดตั้งอะไร)
+
+Google AI Studio คือแพลตฟอร์ม online ที่ใช้สร้างโปรเจกต์นี้ สามารถรัน Web App ได้ทันทีโดยไม่ต้องติดตั้ง Node.js หรือตั้งค่า API Key เอง
+
+**ขั้นตอนการรัน CraneAI บน Google AI Studio:**
+
+1. เปิด `aistudio.google.com` แล้วล็อกอินด้วย Google Account
+2. กด **Import Project** แล้วอัปโหลดไฟล์ ZIP โปรเจกต์ CraneAI
+3. AI Studio จะติดตั้ง dependencies และ inject `GEMINI_API_KEY` ให้อัตโนมัติ — ไม่ต้องตั้งค่าอะไรเพิ่ม
+4. กดปุ่ม **Run** — Web App จะเปิดใน Preview panel ทางขวา
+5. กด **Settings** ใน Web App ตั้ง WebSocket URL ของ ROSBridge แล้วกด **CONNECT**
+
+**ข้อดีของการรันบน AI Studio:**
+
+- ไม่ต้องติดตั้ง Node.js หรือ npm บนเครื่อง
+- ไม่ต้องสร้างหรือจัดการ `GEMINI_API_KEY` เอง — inject อัตโนมัติ
+- แก้ Code และเห็นผลได้ใน Preview แบบ Real-time
+- สามารถ Deploy เป็น Public URL ให้คนอื่นเข้าได้ทันทีผ่านปุ่ม **Deploy**
+
+---
+
+## 6. Tools & Concepts ที่ใช้สร้าง Web App
+
+| Tool / Library | หมวด | ใช้ทำอะไรในโปรเจกต์นี้ |
+|---|---|---|
+| React 19 | Frontend Framework | สร้าง UI ทั้งหมด แบ่งเป็น Component, จัดการ State ด้วย `useState`/`useRef`/`useMemo` |
+| TypeScript | ภาษา | Type-safe code ป้องกัน bug จาก data type ผิดพลาด |
+| Vite | Build Tool | Dev server รันเร็ว, Build production, inject ENV variable |
+| Tailwind CSS 4 | CSS Framework | Styling ทั้งหมดผ่าน utility class โดยไม่เขียน CSS แยก |
+| Framer Motion (`motion`) | Animation | Page transition, Fade-in, `AnimatePresence` เปลี่ยนหน้าแบบ smooth |
+| ROSLIB.js | ROS Connector | เชื่อม Browser กับ ROS2 ผ่าน WebSocket (ROSBridge) — publish/subscribe topic |
+| Lucide React | Icons | ไอคอน UI ทั้งหมด (Home, Settings, Users, BarChart ฯลฯ) |
+| `@google/genai` (Gemini) | AI SDK | Gemini API — ติดตั้งไว้ใน `package.json` พร้อมใช้งาน (inject ผ่าน `vite.config`) |
+| Google AI Studio | Dev Platform | แพลตฟอร์มที่ใช้สร้างและ Deploy โปรเจกต์นี้ (AI Studio App) |
+| ROS2 | Robot OS Middleware | ควบคุม Hardware — Node รับ topic `/web_control_topic` จาก Web |
+| Python 3 (`rclpy`) | Backend | เขียน ROS2 Node ใน Python — ควบคุม Motor, Encoder, Limit Switch ผ่าน UDP |
+| UDP Socket | Network | ส่งคำสั่งจาก ROS2 Node ไปยัง Raspberry Pi ที่ต่อกับ Hardware |
+| Gazebo (Digital Twin) | Simulation | จำลองโมเดล 3D เครนใน Gazebo ให้ขยับตาม Encoder จริง |
+| Intel RealSense | Hardware | กล้อง Depth Camera ตรวจจับพิกัดจุดตักวัสดุด้วย AI |
+
+---
+
+## 7. โครงสร้างระบบ (Architecture)
+
+| Layer | ส่วนประกอบ | สื่อสารผ่าน |
+|---|---|---|
+| User (Browser) | React Web App (`localhost:3000`) | กด UI → WebSocket |
+| ROS2 Bridge | ROSBridge Server (`:9090`) | WebSocket → ROS2 Topic |
+| ROS2 Node | `app.py` / `crane_control_node.py` | ROS Topic → UDP packet |
+| Hardware | Raspberry Pi + Motor + Encoder | GPIO / Serial |
+| Simulation | Gazebo Digital Twin | JointTrajectory topic |
+
+```
+Browser (React)
+   │  WebSocket
+   ▼
+ROSBridge Server (:9090)
+   │  ROS2 Topic
+   ▼
+ROS2 Node (app.py / crane_control_node.py)
+   │  UDP packet
+   ▼
+Raspberry Pi → Motor + Encoder (GPIO / Serial)
+   │
+   └─→ Gazebo Digital Twin (JointTrajectory topic)
 ```
 
 ---
 
-## 4. 3D Model, URDF และ XACRO
+## 8. Height Map (ระบบแผนที่ความสูงวัสดุ)
 
-### 4.1 ขั้นตอนการออกแบบ
+### 8.1 ภาพรวม (Overview)
 
-| ขั้น | เครื่องมือ | ผลลัพธ์ |
+Height Map คือระบบสร้างแผนที่ความสูงแบบ Real-time ของกองหิน/ทรายในแต่ละสถานี โดยใช้ข้อมูล Point Cloud จากกล้อง Intel RealSense D435 แปลงเป็น 2D Grid แสดงระดับความลึก/ความสูงของวัสดุ ช่วยให้ระบบ AI เลือกจุดตักที่เหมาะสมที่สุดได้อัตโนมัติ
+
+ข้อมูล Point Cloud ถูกส่งผ่าน UDP จาก `pointcloud_sender.py` บน ROS2 ไปยัง `pointcloud_receiver_v3.py` แล้วส่งต่อเป็น Depth Grid ไปยัง `app.py` (Pi Bridge) เพื่อแสดงผลบน Web App หน้า `/3d`
+
+### 8.2 ไฟล์และการไหลของข้อมูล (Files & Data Flow)
+
+| ไฟล์ | ตำแหน่ง | หน้าที่ |
 |---|---|---|
-| 1. ออกแบบโมเดล 3D | SolidWorks | CAD แยกเป็น Link/Joint |
-| 2. ส่งออก URDF | sw2urdf exporter | cranemotor.urdf + meshes/*.stl |
-| 3. แปลงเป็น XACRO | xacro tool (ROS2) | cranemotor.xacro (นำกลับมาใช้ใหม่ได้) |
+| `pointcloud_sender.py` | ROS2 (PC) | Subscribe `/camera/depth/color/points` (PointCloud2), แปลงเป็น world-frame XYZ แล้ว project เป็น Depth Grid ส่งผ่าน UDP ไปยัง Pi Bridge |
+| `pointcloud_receiver_v3.py` | ROS2 (PC) | รับ UDP Depth Grid จาก sender, คำนวณ per-station height calibration (`CALIB_PTS` / `STATION_COEFFS`), แปลงค่า Z-depth (`pz_m × 1000` mm) เป็น height map พร้อม fallback intrinsic กล้อง (424×240, fx/fy=380) |
+| `app.py` (Pi Bridge) | Raspberry Pi | รับ Depth Grid ผ่าน `pc_recv_worker` thread (UDP), เก็บใน shared memory, broadcast ไปยัง Web App ผ่าน WebSocket (`/3d` endpoint) |
+| Web App `/3d` View | Browser (React) | รับ Depth Grid ผ่าน WebSocket แสดงผลเป็น 3D Point Cloud / Height Map แบบ Real-time พร้อม Color Mapping ตามระดับความสูง |
 
-### 4.2 หลักการออกแบบ 3D สำหรับ ROS2
+### 8.3 Per-Station Height Calibration
 
-| ชื่อ Link | ลักษณะ | หมายเหตุ |
-|---|---|---|
-| base_link | ฐาน | คงที่ — ไม่เคลื่อนที่ |
-| head_Link | หัวเครน | Revolute — หมุนรอบแกน Z (±90°) |
-| arm_Link | แขน | Prismatic — เลื่อนขึ้น-ลงตามแกน Z |
+แต่ละสถานี (Station 1–3) มีค่า Calibration แยกกัน เนื่องจากตำแหน่งติดตั้งกล้องและระยะห่างจากพื้นไม่เท่ากัน ระบบใช้ Polynomial Regression ปรับ offset ระหว่าง Raw Z-depth กับความสูงวัสดุจริง
 
-กฎสำคัญที่ต้องปฏิบัติ:
-- แยกชิ้นงานให้ชัดเจน — ฐาน หัว แขน เป็นคนละไฟล์
-- กำหนด Coordinate Frame ตาม ROS REP-103 (X=ไปข้างหน้า, Y=ซ้าย, Z=ขึ้น)
-- บันทึกจุด Joint Center ที่กึ่งกลางชิ้นงาน
-- สร้าง Collision Mesh แยกจาก Visual Mesh (ใช้รูปทรงเรียบง่าย)
-- ส่งออก mesh ในหน่วย **Meter**
-
-### 4.3 ส่งออก STL แบบ Manual (กรณีไม่ใช้ sw2urdf)
-
-```bash
-# ใน SolidWorks:
-# File → Save As → STL (.stl)
-#   → Options → Unit: Meters
-#   → Resolution: Fine
-# ทำซ้ำสำหรับทุก Part: base.stl, head.stl, arm.stl
-```
-
-```bash
-# ตรวจสอบ mesh ด้วย MeshLab:
-# Filters → Cleaning → Remove Duplicated Vertex
-# Filters → Cleaning → Remove Non Manifold Edge
-```
-
-โครงสร้างโฟลเดอร์ที่ต้องมี:
-
-```
-src/crane_motor/
-├── meshes/
-│   ├── base.stl
-│   ├── head.stl
-│   └── arm.stl
-├── urdf/
-│   └── cranemotor.urdf
-├── config/
-│   └── controllers.yaml
-└── launch/
-    └── display.launch.py
-```
-
-### 4.4 ตั้งค่า Joint ใน sw2urdf
-
-| Joint | Type | ขีดจำกัด |
-|---|---|---|
-| headcrane_Link | revolute | axis=Z, limit=±1.5708 rad |
-| armcrane_Link | prismatic | axis=Z, limit=-0.52 ถึง 0.0 m |
-
-### 4.5 cranemotor.urdf ฉบับสมบูรณ์
-
-> 📌 บันทึกไฟล์นี้ที่ `src/crane_motor/urdf/cranemotor.urdf`
-
-```xml
-<?xml version="1.0"?>
-<robot name="crane_motor">
-
-  <!-- ===== BASE LINK (ติดกับพื้น) ===== -->
-  <link name="base_link">
-    <visual>
-      <geometry>
-        <mesh filename="package://crane_motor/meshes/base.stl"/>
-      </geometry>
-    </visual>
-    <collision>
-      <geometry><box size="0.5 0.5 0.3"/></geometry>
-    </collision>
-    <inertial>
-      <mass value="10.0"/>
-      <inertia ixx="0.1" ixy="0" ixz="0"
-               iyy="0.1" iyz="0" izz="0.1"/>
-    </inertial>
-  </link>
-
-  <!-- ===== HEAD LINK (หัวเครน) ===== -->
-  <link name="head_Link">
-    <visual>
-      <geometry>
-        <mesh filename="package://crane_motor/meshes/head.stl"/>
-      </geometry>
-    </visual>
-    <collision>
-      <geometry><cylinder radius="0.1" length="0.3"/></geometry>
-    </collision>
-    <inertial>
-      <mass value="3.0"/>
-      <inertia ixx="0.05" ixy="0" ixz="0"
-               iyy="0.05" iyz="0" izz="0.02"/>
-    </inertial>
-  </link>
-
-  <!-- ===== ARM LINK (แขนบังกี้) ===== -->
-  <link name="arm_Link">
-    <visual>
-      <geometry>
-        <mesh filename="package://crane_motor/meshes/arm.stl"/>
-      </geometry>
-    </visual>
-    <collision>
-      <geometry><box size="0.05 0.05 0.6"/></geometry>
-    </collision>
-    <inertial>
-      <mass value="1.5"/>
-      <inertia ixx="0.02" ixy="0" ixz="0"
-               iyy="0.02" iyz="0" izz="0.001"/>
-    </inertial>
-  </link>
-
-  <!-- ===== REVOLUTE JOINT (หัวเครนหมุน) ===== -->
-  <joint name="headcrane_Link" type="revolute">
-    <parent link="base_link"/>
-    <child link="head_Link"/>
-    <origin xyz="0 0 0.5" rpy="0 0 0"/>
-    <axis xyz="0 0 1"/>
-    <limit lower="-1.5708" upper="1.5708"
-           effort="10" velocity="1.0"/>
-  </joint>
-
-  <!-- ===== PRISMATIC JOINT (แขนบังกี้เลื่อน) ===== -->
-  <joint name="armcrane_Link" type="prismatic">
-    <parent link="head_Link"/>
-    <child link="arm_Link"/>
-    <origin xyz="0 0 0" rpy="0 0 0"/>
-    <axis xyz="0 0 1"/>
-    <limit lower="-0.52" upper="0.0"
-           effort="100" velocity="0.5"/>
-  </joint>
-
-  <!-- ===== ROS2 CONTROL ===== -->
-  <ros2_control name="crane" type="system">
-    <hardware>
-      <plugin>gazebo_ros2_control/GazeboSystem</plugin>
-    </hardware>
-    <joint name="headcrane_Link">
-      <command_interface name="position"/>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-    </joint>
-    <joint name="armcrane_Link">
-      <command_interface name="position"/>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-    </joint>
-  </ros2_control>
-
-</robot>
-```
-
-### 4.6 cranemotor.xacro ฉบับสมบูรณ์
-
-> 📌 บันทึกไฟล์นี้ที่ `src/crane_motor/urdf/cranemotor.xacro`
-
-```xml
-<?xml version="1.0"?>
-<robot xmlns:xacro="http://www.ros.org/wiki/xacro"
-       name="crane_motor">
-
-  <!-- ===== PARAMETERS ===== -->
-  <xacro:property name="head_limit"     value="1.5708"/>
-  <xacro:property name="arm_limit_down" value="-0.52"/>
-  <xacro:property name="arm_limit_up"   value="0.0"/>
-  <xacro:property name="base_mass"      value="10.0"/>
-  <xacro:property name="head_mass"      value="3.0"/>
-  <xacro:property name="arm_mass"       value="1.5"/>
-
-  <!-- ===== MACRO: สร้าง inertial ===== -->
-  <xacro:macro name="simple_inertial" params="mass ixx iyy izz">
-    <inertial>
-      <mass value="${mass}"/>
-      <inertia ixx="${ixx}" ixy="0" ixz="0"
-               iyy="${iyy}" iyz="0" izz="${izz}"/>
-    </inertial>
-  </xacro:macro>
-
-  <!-- ===== BASE LINK ===== -->
-  <link name="base_link">
-    <visual>
-      <geometry>
-        <mesh filename="package://crane_motor/meshes/base.stl"/>
-      </geometry>
-    </visual>
-    <collision>
-      <geometry><box size="0.5 0.5 0.3"/></geometry>
-    </collision>
-    <xacro:simple_inertial mass="${base_mass}"
-                           ixx="0.1" iyy="0.1" izz="0.1"/>
-  </link>
-
-  <!-- ===== HEAD LINK ===== -->
-  <link name="head_Link">
-    <visual>
-      <geometry>
-        <mesh filename="package://crane_motor/meshes/head.stl"/>
-      </geometry>
-    </visual>
-    <collision>
-      <geometry><cylinder radius="0.1" length="0.3"/></geometry>
-    </collision>
-    <xacro:simple_inertial mass="${head_mass}"
-                           ixx="0.05" iyy="0.05" izz="0.02"/>
-  </link>
-
-  <!-- ===== ARM LINK ===== -->
-  <link name="arm_Link">
-    <visual>
-      <geometry>
-        <mesh filename="package://crane_motor/meshes/arm.stl"/>
-      </geometry>
-    </visual>
-    <collision>
-      <geometry><box size="0.05 0.05 0.6"/></geometry>
-    </collision>
-    <xacro:simple_inertial mass="${arm_mass}"
-                           ixx="0.02" iyy="0.02" izz="0.001"/>
-  </link>
-
-  <!-- ===== REVOLUTE JOINT ===== -->
-  <joint name="headcrane_Link" type="revolute">
-    <parent link="base_link"/>
-    <child link="head_Link"/>
-    <origin xyz="0 0 0.5" rpy="0 0 0"/>
-    <axis xyz="0 0 1"/>
-    <limit lower="-${head_limit}" upper="${head_limit}"
-           effort="10" velocity="1.0"/>
-  </joint>
-
-  <!-- ===== PRISMATIC JOINT ===== -->
-  <joint name="armcrane_Link" type="prismatic">
-    <parent link="head_Link"/>
-    <child link="arm_Link"/>
-    <origin xyz="0 0 0" rpy="0 0 0"/>
-    <axis xyz="0 0 1"/>
-    <limit lower="${arm_limit_down}" upper="${arm_limit_up}"
-           effort="100" velocity="0.5"/>
-  </joint>
-
-  <!-- ===== ROS2 CONTROL ===== -->
-  <ros2_control name="crane" type="system">
-    <hardware>
-      <plugin>gazebo_ros2_control/GazeboSystem</plugin>
-    </hardware>
-    <joint name="headcrane_Link">
-      <command_interface name="position"/>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-    </joint>
-    <joint name="armcrane_Link">
-      <command_interface name="position"/>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-    </joint>
-  </ros2_control>
-
-</robot>
-```
-
-### 4.7 แปลง XACRO เป็น URDF
-
-```bash
-# ติดตั้ง xacro
-sudo apt install ros-humble-xacro
-
-# ไปที่ urdf folder
-cd ~/dev_ws/ros2_ws/src/crane_motor/urdf/
-
-# แปลง XACRO → URDF
-xacro cranemotor.xacro > cranemotor.urdf
-
-# ตรวจสอบผลลัพธ์
-check_urdf cranemotor.urdf
-# ผลที่ต้องได้:
-# robot name is: crane_motor
-# ---------- Successfully Parsed XML ---------------
-
-# ดู tree structure
-urdf_to_graphviz cranemotor.urdf
-```
-
-### 4.8 Encoder ↔ Joint Mapping
-
-| พารามิเตอร์ | ค่า | หมายเหตุ |
-|---|---|---|
-| ENCODER_MIN | 0 | ซ้ายสุด (Limit Switch 1 กด) |
-| ENCODER_MAX | 61 | ขวาสุด (Limit Switch 2 กด) |
-| GAZEBO_RAD_MIN | -1.60 rad | mapping จาก encoder 0 |
-| GAZEBO_RAD_MAX | +1.60 rad | mapping จาก encoder 61 |
-| E2_MIN / E2_MAX | 0 / 325 | แขนล่างสุด / บนสุด |
-| ARM_RAD_AT_E2_MIN | -0.52 rad | joint armcrane แขนลงสุด |
-| ARM_RAD_AT_E2_MAX | 0.0 rad | joint armcrane แขนขึ้นสุด |
-
----
-
-## 5. ลำดับการเปิดระบบ (Startup Sequence)
-
-> ⚠️ **เปิดตามลำดับ 1→8 — หากเปิดผิดลำดับ: Controller ไม่โหลดหรือ Gazebo crash**
-
-| ลำดับ | เปิดบน | คำสั่ง |
-|---|---|---|
-| 1 | Windows CMD | `cd Desktop && python udp_bridge.py` ← **เปิดก่อนทุกอย่าง** |
-| 2 | Ubuntu WSL2 | `ros2 launch rosbridge_server rosbridge_websocket_launch.xml` |
-| 3 | Ubuntu WSL2 | `gazebo --verbose -s libgazebo_ros_init.so -s libgazebo_ros_factory.so` (รอจน Gazebo เปิด!) |
-| 4 | Ubuntu WSL2 | `ros2 run robot_state_publisher robot_state_publisher ~/dev_ws/ros2_ws/src/crane_motor/urdf/cranemotor.urdf` |
-| 5 | Ubuntu WSL2 | `ros2 run gazebo_ros spawn_entity.py -entity crane_motor -topic robot_description` |
-| 6 | Ubuntu WSL2 | `ros2 control load_controller --set-state active joint_state_broadcaster && ros2 control load_controller --set-state active arm_group_controller` |
-| 7 | Ubuntu WSL2 | `python3 ~/dev_ws/ros2_ws/src/crane_motor/scripts/mainROS.py` (รอ Pi ส่ง START) |
-| 8 | Raspberry Pi | `cd ~/dev_ws && python3 mainPI.py` (กดปุ่ม Start เพื่อเริ่ม) |
-
-### 5.1 ตรวจสอบหลังเปิดระบบ
-
-```bash
-ros2 topic list                    # ดู topic ทั้งหมด — ต้องเห็น /joint_states
-ros2 topic echo /joint_states      # ดู joint position realtime
-ros2 control list_controllers      # ต้องเห็น active ทั้ง 2 controller
-ros2 topic echo /crane_status      # ดูสถานะเครนรวม
-```
-
-### 5.2 ระบบ GPIO ฮาร์ดแวร์
-
-| ปุ่ม/เซ็นเซอร์ | GPIO | ผล |
-|---|---|---|
-| ปุ่ม Start | GPIO 17 | ส่ง ARM → START ไปยัง STM32 → ไฟเขียวติด |
-| ปุ่ม Stop | GPIO 27 | STOP + DISARM → ระบบหยุดทันที → ไฟแดงติด |
-| Emergency | GPIO 16 | ปิดฉุกเฉินทันที → ไฟแดงไม่หยุด |
-| Pressure Sensor | GPIO 22 | ต้องกดก่อนเริ่มได้ |
-
-| ไฟ | หมายเหตุ |
-|---|---|
-| เขียว | ระบบทำงาน (is_running=1) |
-| แดง | Error / Emergency |
-| แดงต่อเนื่อง | Emergency กำลังทำงาน |
-| น้ำเงิน | ประมวลผล AI |
-
----
-
-## 6. คำสั่งควบคุม (Command Reference)
-
-### 6.1 คำสั่งหลัก (mainROS.py CLI)
-
-| คำสั่ง | หน้าที่ |
-|---|---|
-| `c1` | รอบ → ช่องที่ 1 (E1=7) |
-| `c2` | รอบ → ช่องที่ 2 (E1=32) |
-| `c3` | รอบ → ช่องที่ 3 (E1=54) |
-| `x` | Full Auto Loop ทุก Slot (1→2→3) |
-| `h` | Homing → ยกแขน → ขยับไป LS1 → รีเซ็ต E1=0 |
-| `m <E1>` | ขยับหัวไปตำแหน่ง encoder ที่กำหนด (เช่น `m25`) |
-| `reset_manual` | Force Homing ก่อน Manual ครั้งถัดไป |
-| `q` / `stop` | Emergency_shutdown() ทันที |
-
-### 6.2 Keyboard Teleop (teleop_crane_motor.py)
-
-| ปุ่ม | การกระทำ |
-|---|---|
-| `q` | head_Link + (+0.1 rad) — หัวขวา |
-| `a` | head_Link - (-0.1 rad) — หัวซ้าย |
-| `w` | arm_Link + (+0.05 m) — ยืดแขน |
-| `s` | arm_Link - (-0.05 m) — หดแขน |
-| `Space` | รีเซ็ต joint ทั้งหมดเป็น 0 |
-| `Ctrl+C` | หยุดโหนด teleop |
-
-### 6.3 Debug Keys (mainPI.py realtime display)
-
-| ปุ่ม | หน้าที่ |
-|---|---|
-| `1` / `2` / `3` | เลือก Station (ROI) วิเคราะห์ |
-| `d` | สลับโหมด Debug — แสดง/ซ่อนตาราง 4 แผง |
-| `r` | รีเซ็ตรอบการจับกลับเป็นรอบที่ 1 |
-| `Space` | Trigger การจับภาพ/วิเคราะห์ด้วยตนเอง |
-| `q` | ออกจากโปรแกรม |
-
----
-
-## 7. ระบบกล้องและ AI (Vision & ONNX)
-
-### 7.1 ขั้นตอนการวิเคราะห์ภาพ
-
-| # | ขั้น | รายละเอียด | น้ำหนัก |
+| Parameter | Station 1 (ทราย) | Station 2 (หินเล็ก) | Station 3 (หินใหญ่) |
 |---|---|---|---|
-| 1 | Mask ROI | พื้นที่นอก ROI (erode 55px) | — |
-| 2 | Depth Prominence Map | หา peak จากแผนที่ความลึก (Top-Hat 3 ขนาด) | 45% |
-| 3 | Refraction Map | วิเคราะห์ความแตกต่างแสงผ่าน surface normals | 20% |
-| 4 | Specular Map | หาจุดสว่าง specular ผ่าน LAB color space | 15% |
-| 5 | Diffuse Gradient Map | วิเคราะห์การไล่ระดับสีจาก log-illumination | 10% |
-| 6 | Curvature (Sobel) | ขอบและโค้งของพื้นผิวจาก Sobel depth gradient | 10% |
-| 7 | ONNX Prediction | ทำนายตำแหน่ง (x,y) จาก RGB 224×224 | backup |
-| 8 | Multi-Peak | หาจุดสูงสุด 3 จุด ระยะขั้นต่ำ 60px | — |
-| 9 | E1 Mapping | ตำแหน่ง x ใน ROI → ค่า encoder E1 | — |
+| กล้อง Resolution | 424 × 240 px | 424 × 240 px | 424 × 240 px |
+| Focal Length (fx/fy) | 380 px (fallback) | 380 px (fallback) | 380 px (fallback) |
+| Principal Point (cx, cy) | cx=212, cy=120 | cx=212, cy=120 | cx=212, cy=120 |
+| Depth Method | `pz_m * 1000` (Z-depth โดยตรง ไม่ใช้ Euclidean distance) | เหมือนกัน | เหมือนกัน |
 
-### 7.2 การตั้งค่ากล้อง (Intel RealSense D435)
+### 8.4 ขั้นตอนการประมวลผล (Processing Pipeline)
 
-| พารามิเตอร์ | ค่า |
-|---|---|
-| Depth Stream | 640×480 px, Z16, 30 FPS |
-| Color Stream | 640×480 px, BGR8, 30 FPS |
-| Spatial Filter | size=3, alpha=0.55, delta=20 |
-| Temporal Filter | เปิดใช้งาน |
-| มุมกล้อง | 45° |
-| ความสูงอ้างอิงกอง | 180 mm |
-| วิเคราะห์ทุก | 3 วินาที/ครั้ง |
-| ONNX Input | 224×224×3 (RGB, CHW) |
-| ONNX Output | พิกัด normalize (x, y) ช่วง 0–1 |
-| Flask Stream URL | `http://<Pi_IP>:5002/video_feed` (JPEG quality 65) |
-
-### 7.3 สถานี ROI
-
-| Station | จุด ROI (pixel) | ช่วง E1 | Clamp E1 Output |
-|---|---|---|---|
-| 1 | (202,199),(601,177),(535,424),(265,424) | -4 ถึง 19 | 0–12 |
-| 2 | (73,319),(636,262),(558,427),(196,459) | 13 ถึง 50 | 24–38 |
-| 3 | (186,203),(542,174),(500,425),(260,433) | 46 ถึง 61 | 48–61 |
-
-### 7.4 ระบบความปลอดภัย YOLO
-
-| พารามิเตอร์ | ค่า |
-|---|---|
-| Model | YOLOv8 nano (yolov8n.pt) |
-| Confidence Threshold | 0.35 (เพิ่มเป็น 0.5 ถ้า false positive บ่อย) |
-| ช่วงตรวจสอบ | 0.25 วินาที (4 FPS) |
-| Debounce อันตราย | 2.0 วินาที |
-| Countdown ล้าง | 3.0 วินาที |
-| Max Danger Timeout | 120.0 วินาที → Emergency_shutdown() |
-| ROI | บน 15%, ล่าง 85%, ซ้าย 10%, ขวา 90% |
-| Risk Classes | person, bicycle, car, motorcycle, bus, truck, cat, dog, horse, cow, bird |
-| รอบลงคะแนน (Pi XCAP) | 3 รอบ × 1.1s → majority ≥2/3 = อันตราย |
-
----
-
-## 8. แผนผัง Hardware
-
-### 8.1 STM32F103C8T6 — Input Pins
-
-| Pin | สัญญาณ | Mode | หมายเหตุ |
-|---|---|---|---|
-| PA0 | ENC_A | INPUT_PULLUP | Encoder 1 Channel A (หัวเครน) — Interrupt CHANGE |
-| PA1 | ENC_B | INPUT_PULLUP | Encoder 1 Channel B |
-| PB6 | ENC2_A | INPUT_PULLUP | Encoder 2 Channel A (แขนบังกี้) — Interrupt CHANGE |
-| PB7 | ENC2_B | INPUT_PULLUP | Encoder 2 Channel B |
-| PB0 | LIMIT1 | INPUT_PULLUP | Limit Switch 1 — LOW=กด → รีเซ็ต E1=0 |
-| PB1 | LIMIT2 | INPUT_PULLUP | Limit Switch 2 — LOW=กด → รีเซ็ต E1=-ENC_SCALE |
-| PB12 | PHOTO1 | INPUT_PULLUP | Photo Sensor 1 (กดค้าง 2 วินาที → ยืนยัน P1) |
-| PA4 | PHOTO2 | INPUT_PULLUP | Photo Sensor 2 |
-| PA6 | PHOTO3 | INPUT_PULLUP | Photo Sensor 3 |
-| PA7 | PHOTO4 | INPUT_PULLUP | Photo Sensor 4 — P4=1 → force E2=0 |
-| A9 (RX) | STM32 RX | UART | รับคำสั่งจาก Pi (GPIO14) |
-| A10 (TX) | STM32 TX | UART | ส่งไปยัง Pi (GPIO15) |
-
-### 8.2 STM32F103C8T6 — Output Pins
-
-| Pin | สัญญาณ | SSR | หมายเหตุ |
-|---|---|---|---|
-| PB10 | MAG1 | SSR 4-1 | มอเตอร์ทิศทาง 1 (ซ้าย) — LOW=ON |
-| PB9 | MAG2 | SSR 4-2 | มอเตอร์ทิศทาง 2 (ขวา) — LOW=ON |
-| PA5 | VALVE_UP | SSR 1-2 | Valve UP (ยกแขนบังกี้) — LOW=ON |
-| PB14 | VALVE_DOWN | SSR 1-3 | Valve DOWN (ลดแขนบังกี้) — LOW=ON |
-| PB13 | VALVE_BRAKE1 | SSR 1-4 | Brake 1 — LOW=ON |
-| PB8 | VALVE_BRAKE2 | SSR 1-5 | Brake 2 — LOW=ON |
-| PA2 | DIR_VALVE | — | วาล์วควบคุมทิศทาง — LOW=เปิด |
-
-### 8.3 Raspberry Pi 5 — GPIO
-
-| GPIO | สัญญาณ | ทิศทาง | หมายเหตุ |
-|---|---|---|---|
-| GPIO 14 | STM32 TX (A10) | TX→STM32 | Serial UART ส่งคำสั่ง |
-| GPIO 15 | STM32 RX (A9) | RX←STM32 | Serial UART รับสัญญาณ |
-| GPIO 17 | Start Button | Input | pull_up=True |
-| GPIO 27 | Stop Button | Input | → reset_all_systems() |
-| GPIO 22 | Pressure Sensor | Input | False → block start |
-| GPIO 16 | Emergency Button | Input | is_active=False (LOW=active) |
-| GPIO 23 | Green LED (SSR 2-2) | Output | ON = ระบบทำงาน |
-| GPIO 24 | Red LED (SSR 2-3) | Output | ON = Error / Emergency |
-| GPIO 25 | Blue LED (SSR 2-4) | Output | ON = AI ประมวลผล |
-
----
-
-## 9. UDP และ Serial Protocol
-
-### 9.1 คำสั่งที่ ROS PC ส่งไปยัง Pi (Port 5001)
-
-| คำสั่ง | หมายเหตุ |
-|---|---|
-| `MAG1_ON` / `MAG1_OFF` | เปิด/ปิดมอเตอร์ทิศทางที่ 1 (ซ้าย) |
-| `MAG2_ON` / `MAG2_OFF` | เปิด/ปิดมอเตอร์ทิศทางที่ 2 (ขวา) |
-| `UP_ON` / `UP_OFF` | ยก/หยุดยกแขนบังกี้ (ทำซ้ำวาล์วทุก 1 วินาที นาน 13 วินาที) |
-| `DOWN_ON` / `DOWN_OFF` | ลด/หยุดลดแขนบังกี้ |
-| `B1_ON` / `B1_OFF` | เปิด/ปิด Brake 1 |
-| `B2_ON` / `B2_OFF` | เปิด/ปิด Brake 2 |
-| `ARM` | ต่อ ARM ก่อน START |
-| `START` | เริ่มระบบ STM32 |
-| `DISARM` | ปิดระบบ STM32 |
-| `STOP` | หยุดฉุกเฉินทันที |
-| `{"XCAP":1,"SLOT":1,"ROUND":1,"PCT":100}` | ขอให้ Pi วิเคราะห์ตำแหน่ง → ตอบกลับด้วย TARGET_E1 |
-
-### 9.2 Pi ส่งกลับ → ROS (Port 5000)
-
-| รูปแบบ | หมายเหตุ |
-|---|---|
-| `E1:<value>` | Encoder 1 — ตำแหน่งหัวเครน (count/10) realtime |
-| `E2:<value>` | Encoder 2 — ตำแหน่งแขนบังกี้ (count/10) realtime |
-| `LS1:1` / `LS2:1` | Limit Switch กด → รีเซ็ต E1=0 หรือ E1=-10 |
-| `P1-P4:<0/1>` | ยืนยัน Photo Sensor (กดค้าง 2 วินาที) |
-| `{"TARGET_E1":25,...}` | ผลวิเคราะห์ตำแหน่งจากกล้อง |
-| `{"PRESS_STOP":1,...}` | Pi auto stop เพราะ pressure sensor หลุด |
-| `{"START_BLOCKED":1,...}` | Pi Block START เพราะ emergency |
-
-### 9.3 Serial STM32 Messages
-
-| รูปแบบ | ตัวอย่าง | หมายเหตุ |
+| Step | ขั้นตอน | รายละเอียด |
 |---|---|---|
-| `E1:<value>` | `E1:32` | Encoder 1 = encoderCount/10 |
-| `E2:<value>` | `E2:150` | Encoder 2 = encoder2Count/10 |
-| `READY` | `READY` | ส่งครั้งเดียวตอน boot |
-| `ARMED` / `DISARMED` | `ARMED` | ตอบคำสั่ง ARM/DISARM |
-| `SYSTEM:ON` / `SYSTEM:OFF` | `SYSTEM:ON` | ตอบคำสั่ง START/STOP |
-| `ERROR: Not Armed` | `ERROR: Not Armed` | ส่ง START ก่อน ARM |
-| `DBG \| E1:... E2:...` | `DBG \| E1:5 E2:10 \| LS1:0...` | Debug report เมื่อค่าเปลี่ยน |
+| 1 | Capture PointCloud2 | RealSense D435 publish `/camera/depth/color/points` ที่ 424×240 px ความถี่ ~30 fps |
+| 2 | Project to World Frame XYZ | `pointcloud_sender_patched.py` แปลง camera frame → world frame แล้ว project XYZ ลงบน Depth Grid (2D array) |
+| 3 | UDP Transmission | ส่ง Depth Grid แบบ binary packet ผ่าน UDP (low latency) จาก ROS2 PC ไปยัง Raspberry Pi |
+| 4 | Height Calibration Apply | `pi_recv_worker` รับ packet, ใช้ `STATION_COEFFS` ของสถานีปัจจุบัน (สลับด้วย keyboard 1/2/3) ปรับค่าความสูงตาม `CALIB_PTS` polynomial |
+| 5 | WebSocket Broadcast | `app.py` ส่ง Height Map (JSON หรือ binary) ผ่าน WebSocket ไปยัง Web App ทุก ~50ms |
+| 6 | 3D Visualization (`/3d`) | Web App render Height Map เป็น 3D Point Cloud พร้อม Color Gradient (น้ำเงิน=ต่ำ, แดง=สูง) แสดง RViz-style ใน Browser |
 
----
+### 8.5 หมายเหตุสำคัญ (Key Notes)
 
-## 10. พารามิเตอร์การกำหนดค่าระบบ
-
-| พารามิเตอร์ | ค่า | หมายเหตุ |
-|---|---|---|
-| Update Rate | 1000 Hz | ros2_control |
-| use_sim_time | true | จาก Gazebo |
-| headcrane_Link PID | 10000.0 / 0.1 / 100.0 | Revolute joint |
-| armcrane_Link PID | 10000.0 / 0.1 / 100.0 | Prismatic joint |
-| PI_IP | 10.0.0.2 | Raspberry Pi (LAN) |
-| PI_PORT | 5001 | UDP Port ของ Pi |
-| Bang-Bang Hz | 20 Hz | Bang-Bang Control Loop |
-| CYCLE_TRAVEL_TIME | 11.0 วินาที | ระยะเวลา 1 รอบ |
-| HOMING_TIMEOUT | 30.0 วินาที | timeout สำหรับ homing |
-| VALVE_REPEAT_INTERVAL | 1.0 วินาที | ส่ง UP/DOWN_ON ซ้ำทุก 1 วินาที |
-| VALVE_REPEAT_DURATION | 13.0 วินาที | ส่งซ้ำนาน 13 วินาที |
-| P4_TIMEOUT | 60.0 วินาที | timeout P4=1 |
-| XCYCLE_CAM_TIMEOUT | 10.0 วินาที | timeout รอ TARGET_E1 |
-| XCYCLE_MAX_PASSES | 20 | จำนวนผ่านสูงสุดต่อ slot |
-| PHOTO_HOLD_MS (STM32) | 2000 ms | Photo Sensor hold 2 วินาที |
-| MIN_PEAK_DISTANCE | 60 px | ระยะขั้นต่ำระหว่าง 2 จุด |
-
----
-
-## 11. Slot เป้าหมาย
-
-| Slot | Encoder เป้าหมาย (E1) | Station ROI | Clamp E1 Output |
-|---|---|---|---|
-| 1 | 7 | 10–12 | — |
-| 2 | 32 | 24–38 | — |
-| 3 | 54 | 48–61 | — |
-
----
-
-## 12. การแก้ไขปัญหา (Troubleshooting)
-
-| อาการ | สาเหตุ | วิธีแก้ไข |
-|---|---|---|
-| `ERROR: Not Armed` | ยังไม่ได้ส่งคำสั่ง ARM | ส่ง ARM ก่อน START |
-| Gazebo ไม่รับ Trajectory | Controller ไม่ทำงาน | `ros2 control list_controllers` → ตรวจ status |
-| E1 ไม่อัปเดต | UDP bridge ไม่ทำงานหรือ IP ผิด | ตรวจ `udp_bridge.py TARGET_IP` |
-| YOLO หยุดระบบบ่อย | YOLO_CONFIDENCE ต่ำ หรือแสงไม่พอ | ปรับ YOLO_CONFIDENCE (0.35 → 0.5) |
-| Photo Sensor ไม่ยืนยัน | ต้องค้างไว้ 2 วินาที | รอ 2 วินาทีหลังวัตถุถึงตำแหน่ง |
-| Serial ไม่เชื่อมต่อ | `/dev/ttyUSB0` ไม่พบหรือสิทธิ์ไม่พอ | `sudo usermod -aG dialout $USER` → reboot |
-| TARGET_E1 ไม่กลับมา | Pi ไม่รับ XCAP หรือวิเคราะห์ไม่ได้ | ตรวจ Model_Fix.onnx และ RealSense USB 3.0 |
-| START ถูก Block | GPIO22 ไม่ทำงาน | กด Pressure Sensor ก่อน START |
-| P4 timeout | ไม่ขึ้นถึงตำแหน่งบน | ตรวจ Photo Sensor 4 และ Valve UP |
-| กล้องไม่เปิด | RealSense ขัดข้องหรือ port 5002 block | ตรวจ USB 3.0 และ firewall port 5002 |
-| Emergency ติดตลอด | GPIO16 ลัดวงจรหรือสายขาด | ตรวจฮาร์ดแวร์ GPIO16 |
-| rosbridge ไม่ต่อ | Port 9090 block | `sudo ufw allow 9090` |
-
-### 12.1 คำสั่ง Debug
-
-```bash
-ros2 topic echo /crane_status        # สถานะเครน realtime
-ros2 topic echo /joint_states        # joint position
-ros2 control list_controllers        # controller status
-screen /dev/ttyUSB0 115200           # serial output STM32 โดยตรง (Pi)
-python3 -c "import onnxruntime; print(onnxruntime.__version__)"
-python3 -c "import pyrealsense2; print('RealSense OK')"
-```
-
----
-
-## 13. ROS2 Topics Reference
-
-| Topic | Message Type | Publisher | Subscriber |
-|---|---|---|---|
-| `/arm_group_controller/joint_trajectory` | JointTrajectory | crane_integrated_system | arm_group_controller |
-| `/joint_states` | JointState | joint_state_broadcaster | crane_integrated_system |
-| `/crane_status` | std_msgs/String (JSON) | crane_integrated_system | Web UI / Monitor |
-| `/web_control_topic` | std_msgs/String (JSON) | Web UI (rosbridge) | crane_integrated_system |
-| `/robot_description` | std_msgs/String (URDF) | robot_state_publisher | nodes |
-| `/tf` / `/tf_static` | TF messages | robot_state_publisher | nodes |
-
----
-
-*CraneAI Extreme | ROS2 Humble • Gazebo • YOLOv8 • ONNX • RealSense D435 • Raspberry Pi 5 • STM32F103*
+- **Depth Calculation:** ใช้ `pz_m * 1000` (Z-depth โดยตรงในหน่วย mm) ไม่ใช้ Euclidean distance เพื่อให้ค่าสอดคล้องกับระบบพิกัดกล้อง
+- **Fallback Intrinsics:** หาก Point Cloud ไม่มีคอลัมน์ pixel u,v ระบบ fallback ไปใช้ค่า intrinsic ของ RealSense D435 ที่ 424×240 (fx=fy=380, cx=212, cy=120) เพื่อป้องกัน `IndexError`
+- **Station Switching:** กด keyboard 1 / 2 / 3 ใน `pointcloud_receiver_v3.py` เพื่อสลับสถานีและโหลด `STATION_COEFFS` ชุดใหม่ โดยไม่ต้องรีสตาร์ท node
+- **Thread Safety:** `pc_recv_worker` ทำงานใน background thread แยกต่างหาก ข้อมูลถูกเขียนลง shared buffer ก่อน WebSocket loop อ่านและ broadcast เพื่อป้องกัน race condition
+- **RViz Parity:** หน้า `/3d` ของ Web App ออกแบบให้แสดงผล Point Cloud ตรงกับที่เห็นใน RViz โดยใช้ข้อมูล Depth Grid ชุดเดียวกัน ทำให้ทีมสามารถ debug ได้ทั้งจาก RViz และ Browser พร้อมกัน
